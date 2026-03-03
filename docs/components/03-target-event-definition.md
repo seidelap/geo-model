@@ -381,22 +381,24 @@ Where π is the structural-zero probability, modeled as `sigmoid(feasibility_sco
 
 ### 6.1 Split Strategy
 
-**Strictly temporal splits.** No random splitting — the model must be evaluated on its ability to predict the future from the past, not to interpolate within observed data.
+**Strictly temporal splits.** No random splitting — the model must be evaluated on its ability to predict the future from the past, not to interpolate within observed data. Use the most recent available data for evaluation so the test set reflects current geopolitical dynamics rather than historical periods.
 
 ```
-Historical data: 1995 ──────────────────────────────────────── 2026
-                 │                          │        │        │
-                 │        Training          │  Val   │  Test  │
-                 │    1995 ─── 2022-06      │  2022  │  2023  │
-                 │                          │  -07   │  -01   │
-                 │                          │  to    │  to    │
-                 │                          │  2022  │  2023  │
-                 │                          │  -12   │  -12   │
+Historical data: 1995 ──────────────────────────────────────────────── 2026
+                 │                                │         │         │
+                 │            Training             │  Val    │  Test   │
+                 │       1995 ─── 2024-09          │  2024   │  2025   │
+                 │                                 │  -10    │  -04    │
+                 │                                 │  to     │  to     │
+                 │                                 │  2025   │  2026   │
+                 │                                 │  -03    │  -03    │
 ```
 
-- **Training:** All data up to 2022-06-30.
-- **Validation:** 2022-07-01 to 2022-12-31 (6 months). Used for hyperparameter tuning, early stopping, calibration set fitting.
-- **Test:** 2023-01-01 to 2023-12-31 (12 months). Evaluated once at the end. Never used for model selection.
+- **Training:** All data up to 2024-09-30.
+- **Validation:** 2024-10-01 to 2025-03-31 (6 months). Used for hyperparameter tuning, early stopping, calibration set fitting.
+- **Test:** 2025-04-01 to 2026-03-31 (12 months). Evaluated once at the end. Never used for model selection.
+
+The test period should always be the most recent available data. As new data arrives, slide the window forward and retrain.
 
 ### 6.2 Expanding Window for Robustness
 
@@ -404,25 +406,54 @@ To verify the model isn't overfit to a specific temporal split:
 
 | Split name | Train end | Val period | Test period |
 |------------|-----------|------------|-------------|
-| Primary | 2022-06 | 2022-07 – 2022-12 | 2023-01 – 2023-12 |
-| Robustness 1 | 2021-06 | 2021-07 – 2021-12 | 2022-01 – 2022-12 |
-| Robustness 2 | 2020-06 | 2020-07 – 2020-12 | 2021-01 – 2021-12 |
+| Primary | 2024-09 | 2024-10 – 2025-03 | 2025-04 – 2026-03 |
+| Robustness 1 | 2023-09 | 2023-10 – 2024-03 | 2024-04 – 2025-03 |
+| Robustness 2 | 2022-09 | 2022-10 – 2023-03 | 2023-04 – 2024-03 |
 
 Report metrics on all three test periods. A model that works well on only one split is overfit.
 
-### 6.3 Embargo Period
+### 6.3 No Gaps Between Splits
 
-Between training data end and validation/test start, enforce a gap equal to the longest prediction horizon (180 days for the extended horizon):
+There is no embargo gap between training and validation/test periods. Training runs right up to the validation boundary and validation runs right up to the test boundary. All available data is used.
 
+The potential concern — that a long prediction horizon (e.g., 180 days) made at the end of training would overlap into the validation period — is handled by modeling ongoing conditions as **state-transition events** rather than as windows that span across split boundaries.
+
+**State-transition approach:** For conditions that persist over time (active conflict, ongoing sanctions, diplomatic crises), predict two distinct events with eligibility constraints:
+
+```python
+# Instead of: "will there be an active embargo in the next 180 days?" (window may span splits)
+# Predict:    "will an embargo START?" and "will an embargo END?"
+
+def is_eligible(event_type: str, actor_i: str, actor_j: str, reference_date: date) -> bool:
+    """
+    State-transition eligibility: only predict transitions that are possible
+    given the current state of the dyad.
+    """
+    current_state = get_current_state(actor_i, actor_j, event_type, reference_date)
+
+    if event_type.endswith("_START"):
+        # Can only start if not already in progress
+        return not current_state.is_active
+    elif event_type.endswith("_END"):
+        # Can only end if currently in progress
+        return current_state.is_active
+    else:
+        # Point events (not state transitions) are always eligible
+        return True
 ```
-Training data ends:    t_train_end
-Embargo period:        [t_train_end, t_train_end + 180 days]
-Validation starts:     t_train_end + 180 days
-```
 
-Wait — this is overly conservative. The embargo only needs to be as long as the prediction horizon being evaluated. For the 7-day horizon, a 7-day gap suffices. For the 180-day horizon, the 180-day gap applies. In practice, use the gap equal to the longest horizon to keep things simple, or evaluate each horizon with its own appropriate gap.
+This eliminates horizon-overlap problems entirely: each prediction is about a discrete transition whose ground truth is a single date, fully within one split. It also produces more actionable predictions — "sanctions will begin" is more useful than "sanctions will be active at some point in a 180-day window."
 
-**Recommended:** Use a 30-day embargo (matching the medium-term horizon that is the primary evaluation target). Evaluate the 90-day and 180-day horizons with the understanding that their earliest predictions partially overlap with the training period.
+**Which event types are state-transitions vs. point events:**
+
+| Modeled as state transitions (START/END) | Modeled as point events |
+|------------------------------------------|------------------------|
+| SANCTION, FIGHT, MOBILIZE, SEIZE | CONSULT, ENGAGE, AGREE, COOP |
+| (ongoing conditions with duration) | (discrete occurrences) |
+| AID (ongoing programs) | DEMAND, THREATEN, PROTEST |
+| REDUCE (sustained policy change) | DISAPPROVE, REJECT, YIELD |
+
+For state-transition types, the training data must be preprocessed to identify onset and termination dates from the raw event stream (see Section 1.3 for how binary targets are constructed from event records).
 
 ---
 

@@ -17,10 +17,10 @@ Evaluate the trained model on held-out test data, apply post-hoc calibration, an
 The test set is strictly future relative to all training data. No information from the test period may leak into training, validation, or calibration.
 
 ```
-Training:    ... ─── 2022-06-30
-Validation:  2022-07-01 ─── 2022-12-31   (model selection, hyperparameter tuning)
+Training:    ... ─── 2024-09-30
+Validation:  2024-10-01 ─── 2025-03-31   (model selection, hyperparameter tuning)
 Calibration: fit on validation set         (temperature scaling parameters)
-Test:        2023-01-01 ─── 2023-12-31    (final evaluation, reported once)
+Test:        2025-04-01 ─── 2026-03-31    (final evaluation, reported once)
 ```
 
 ### 1.2 Evaluation Procedure
@@ -35,7 +35,7 @@ def evaluate(model: FullModel, test_data: TestDataset, calibration_params: dict)
 
     # 1. Replay context: bring actor memories to the state at the start of the test period
     #    using data up to the training cutoff
-    model.replay_to(date(2022, 6, 30))
+    model.replay_to(date(2024, 9, 30))
 
     # 2. For each test reference date, make predictions
     for reference_date in test_data.reference_dates:
@@ -348,9 +348,9 @@ Evaluate on multiple test periods (Component 3, Section 6.2):
 
 | Test period | Brier | BSS vs. baseline | Notes |
 |-------------|-------|-------------------|-------|
-| 2023 (primary) | | | Primary evaluation |
-| 2022 (robustness 1) | | | Should be similar |
-| 2021 (robustness 2) | | | Should be similar |
+| 2025-04 – 2026-03 (primary) | | | Primary evaluation |
+| 2024-04 – 2025-03 (robustness 1) | | | Should be similar |
+| 2023-04 – 2024-03 (robustness 2) | | | Should be similar |
 
 If performance varies drastically across test periods, the model may be fitting to temporal artifacts rather than learning stable geopolitical dynamics.
 
