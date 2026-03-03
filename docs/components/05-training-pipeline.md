@@ -314,8 +314,9 @@ All parameters are trainable, with different learning rates:
 | ConfliBERT encoder | 1e-5 | Small LR: preserve pretraining; just fine-tune |
 | Memory update parameters | 5e-4 | Medium: needs to adapt to supervised signal |
 | Graph attention layers | 5e-4 | Medium: new component, learning from scratch |
-| Event prediction heads | 1e-3 | Larger: top-level heads, most supervised gradient |
-| Hawkes/DeepHit parameters | 1e-3 | Larger: learning temporal dynamics |
+| Survival/hazard heads | 1e-3 | Larger: top-level heads, most supervised gradient |
+| Hawkes excitation parameters | 1e-3 | Larger: learning temporal dynamics |
+| Intensity head (high-freq types) | 1e-3 | Larger: learning rate dynamics |
 | Relation embeddings | 5e-4 | Medium: should shift to capture prediction structure |
 
 ### 5.3 Training Loop
@@ -324,6 +325,10 @@ All parameters are trainable, with different learning rates:
 def phase3_training_step(batch: list[TrainingExample], model: FullModel) -> dict:
     """
     One training step of Phase 3 supervised fine-tuning.
+
+    Two example types:
+    - SurvivalTrainingExample: time-to-event targets (rare/moderate event types)
+    - IntensityTrainingExample: event rate targets (high-frequency event types)
     """
     total_loss = 0.0
     metrics = defaultdict(float)
@@ -339,39 +344,49 @@ def phase3_training_step(batch: list[TrainingExample], model: FullModel) -> dict
             H_all = model.graph_propagation(H_all, edge_index, edge_type, edge_weight)
             h_i, h_j = H_all[i], H_all[j]
 
-        # 3. Build dyadic representation and predict
-        d_ij = model.build_dyadic_representation(h_i, h_j, example.event_type, example.horizon_days)
-        pred = model.prediction_head(d_ij, example.event_type)
+        # 3. Build dyadic representation (no horizon parameter — model outputs full curve)
+        d_ij = model.build_dyadic_representation(h_i, h_j, example.event_type)
 
-        # 4. Compute losses
-        # Primary: focal binary cross-entropy
-        L_focal = focal_loss(pred["logit"], example.label, gamma=2.0, alpha=example.event_type_weight)
+        if isinstance(example, SurvivalTrainingExample):
+            # --- Survival target: time-to-event ---
+            # Get Hawkes excitation from recent event history for this dyad
+            event_history = get_dyad_event_history(example.source_actor_id, example.target_actor_id)
+            excitation = model.hawkes(event_history, example.event_type, example.reference_date, bin_midpoints)
 
-        # Auxiliary: Goldstein regression (if positive example)
-        if example.label == 1:
-            L_goldstein = F.mse_loss(pred["goldstein_pred"], example.event_goldstein)
-        else:
-            L_goldstein = 0.0
+            # Forward pass through survival head (hazard + excitation → survival curve)
+            pred = model.survival_head(d_ij, example.event_type, excitation=excitation)
 
-        # Survival loss (DeepHit)
-        if example.label == 1:
-            survival_pred = model.deephit_head(d_ij)
-            L_survival = deephit_loss(survival_pred, example.days_to_event)
-        else:
-            L_survival = 0.0
+            # Primary loss: DeepHit NLL on the observed event time (or censoring time)
+            L_survival = deephit_loss(
+                pred, example.time_bin_index, example.censored, example.event_type_weight
+            )
 
-        # Memory regularization
+            # Auxiliary: Goldstein regression (if event occurred)
+            if example.event_occurred:
+                L_goldstein = F.mse_loss(pred["goldstein_pred"], example.event_goldstein)
+            else:
+                L_goldstein = 0.0
+
+            weight = example.temporal_weight * example.event_type_weight
+            if example.is_negative:
+                weight *= example.negative_confidence
+
+            step_loss = weight * (L_survival + 0.1 * L_goldstein)
+
+        elif isinstance(example, IntensityTrainingExample):
+            # --- Intensity target: event rate ---
+            L_hawkes = hawkes_nll(
+                model.intensity_head, h_i, h_j, example.event_type,
+                example.event_times, example.period_end - example.period_start
+            )
+            weight = example.temporal_weight * example.event_type_weight
+            step_loss = weight * L_hawkes
+
+        # Regularization (applied to all examples)
         L_mem = 0.01 * (h_i.norm().pow(2) + h_j.norm().pow(2))
-
-        # Gate sparsity penalty
         L_gate = model.get_gate_penalty()
+        step_loss += L_mem + 0.01 * L_gate
 
-        # Weighted sum
-        weight = example.temporal_weight * example.event_type_weight
-        if example.label == 0:
-            weight *= example.negative_confidence
-
-        step_loss = weight * (L_focal + 0.1 * L_goldstein + 0.1 * L_survival + L_mem + 0.01 * L_gate)
         total_loss += step_loss
 
     total_loss /= len(batch)
@@ -455,22 +470,24 @@ if step % M == 0:
 - **Total steps:** ~100K TBPTT windows (≈ 7.5M memory update steps covering the training period multiple times).
 - **Learning rate schedule:** Linear warmup (1000 steps) → constant → cosine decay (last 20%).
 - **Gradient clipping:** Max norm 1.0 to prevent exploding gradients from long temporal chains.
-- **Early stopping:** Monitor validation Brier score. Stop if no improvement for 10 evaluation epochs.
+- **Early stopping:** Monitor validation concordance index (C-index) and Brier scores derived from the CDF. Stop if no improvement for 10 evaluation epochs.
 
 ### 5.8 Evaluation During Training
 
 Every 5,000 steps, run evaluation on the validation set (Component 3, Section 6):
-- Compute Brier score per event type and overall.
-- Compute BSS against Phase 0 baseline.
-- Log reliability diagrams for visual inspection.
-- If BSS is worse than Phase 0 baseline for >50% of event types, something is wrong — investigate before continuing.
+- Derive fixed-horizon Brier scores from the survival CDF at standard horizons (7, 30, 90, 180 days).
+- Compute concordance index (C-index) for event ordering quality.
+- Compute BSS against Phase 0 baseline at the 30-day horizon (primary comparison).
+- Log reliability diagrams for visual inspection at each standard horizon.
+- If BSS is worse than Phase 0 baseline for >50% of event types at the 30-day horizon, something is wrong — investigate before continuing.
 
 ### 5.9 Success Criteria
 
-- **BSS > Phase 0 BSS for ≥14 of 18 event types** (the neural model should improve on the tree baseline for most types).
-- **Aggregate Brier score improvement ≥ 5% over Phase 0** (weighted by event type importance).
-- **Calibration:** ECE < 0.10 before post-hoc calibration (Layer 6 will improve this further).
-- **No regression:** The model should not be worse than Phase 0 on any event type by more than 10% relative BSS. If it is, that type needs debugging.
+- **BSS > Phase 0 BSS at 30-day horizon for ≥14 of 18 event types** (the neural model should improve on the tree baseline for most types).
+- **Aggregate Brier score improvement ≥ 5% over Phase 0 at 30-day horizon** (weighted by event type importance).
+- **C-index ≥ 0.70** for survival-target event types (model correctly orders dyads by time-to-event).
+- **Calibration:** ECE < 0.10 at all standard horizons before post-hoc calibration (Layer 6 will improve this further).
+- **No regression:** The model should not be worse than Phase 0 on any event type by more than 10% relative BSS at the 30-day horizon. If it is, that type needs debugging.
 
 ### 5.10 Compute
 
@@ -482,71 +499,106 @@ Every 5,000 steps, run evaluation on the validation set (Component 3, Section 6)
 
 ## 6. Loss Functions (Detailed)
 
-### 6.1 Focal Loss (Primary)
+### 6.1 DeepHit Survival Loss (Primary — Survival-Target Types)
 
 ```python
-def focal_loss(logit: Tensor, label: Tensor, gamma: float = 2.0, alpha: float = 1.0) -> Tensor:
-    """
-    Focal loss: down-weights easy examples, focuses on hard ones.
-    gamma=2 is standard. alpha is per-class weight (inverse frequency).
-    """
-    p = torch.sigmoid(logit)
-    ce = F.binary_cross_entropy_with_logits(logit, label.float(), reduction="none")
-
-    p_t = p * label + (1 - p) * (1 - label)  # p if y=1, 1-p if y=0
-    focal_weight = (1 - p_t) ** gamma
-
-    return alpha * focal_weight * ce
-```
-
-### 6.2 DeepHit Loss
-
-```python
-def deephit_loss(survival_pred: dict, event_time_bin: int, eta: float = 0.5) -> Tensor:
+def deephit_loss(
+    pred: dict,
+    event_time_bin: int,
+    censored: bool,
+    event_type_weight: float,
+    eta: float = 0.5,
+) -> Tensor:
     """
     DeepHit: NLL + ranking loss for survival prediction.
+
+    For uncensored examples: maximize P(event in observed bin).
+    For censored examples: maximize P(survival to censoring time).
     """
-    hazard = survival_pred["hazard"]
+    pdf = pred["pdf"]         # [K] probability mass per bin
+    survival = pred["survival"]  # [K] survival function
 
-    # NLL: negative log probability of event at observed time
-    L_nll = -torch.log(hazard[event_time_bin] + 1e-8) - torch.log(survival_pred["survival"][event_time_bin - 1] + 1e-8 if event_time_bin > 0 else torch.tensor(1.0))
+    if not censored:
+        # NLL: negative log probability of event at the observed time bin
+        L_nll = -torch.log(pdf[event_time_bin] + 1e-8)
+    else:
+        # Censored: event didn't happen yet. Maximize survival to censoring time.
+        L_nll = -torch.log(survival[event_time_bin] + 1e-8)
 
-    # Ranking: subjects that experienced events earlier should have lower survival
-    # (computed across a batch of examples, omitted here for clarity)
-    L_ranking = 0.0  # computed at batch level
+    # Ranking loss (computed across a batch): subjects that experienced events
+    # earlier should have lower survival values. Ensures correct ordering.
+    # (Implemented at batch level in the training loop, omitted here for clarity.)
+    L_ranking = 0.0  # placeholder; computed by batch-level ranking function
 
     return L_nll + eta * L_ranking
 ```
 
-### 6.3 Hawkes NLL
+### 6.2 Hawkes NLL (Primary — Intensity-Target Types)
 
 ```python
-def hawkes_nll(lambda_fn, event_times: list[float], T_end: float) -> Tensor:
+def hawkes_nll(
+    intensity_head: IntensityHead,
+    h_i: Tensor, h_j: Tensor,
+    event_type: int,
+    event_times: list[float],
+    T_window: float,
+) -> Tensor:
     """
-    Negative log-likelihood of a Hawkes process.
-    """
-    # Log-likelihood of observed events
-    ll = sum(torch.log(lambda_fn(t) + 1e-8) for t in event_times)
+    Negative log-likelihood of a Hawkes process over a time window.
+    Used for high-frequency event types modeled as rates.
 
-    # Integral of intensity (survival term) — approximated by Monte Carlo
-    t_samples = torch.linspace(0, T_end, 100)
-    integral = sum(lambda_fn(t) for t in t_samples) * (T_end / len(t_samples))
+    event_times: exact event times within the window (days from window start)
+    T_window: length of observation window in days
+    """
+    # Log-likelihood of observed events: sum of log-intensity at each event time
+    if len(event_times) > 0:
+        event_t = torch.tensor(event_times)
+        lambda_at_events = intensity_head(h_i, h_j, event_times, event_type, 0.0, event_t)
+        ll = torch.log(lambda_at_events + 1e-8).sum()
+    else:
+        ll = torch.tensor(0.0)
+
+    # Integral of intensity (compensator) — approximated by trapezoidal rule
+    t_grid = torch.linspace(0, T_window, 200)
+    lambda_grid = intensity_head(h_i, h_j, event_times, event_type, 0.0, t_grid)
+    integral = torch.trapezoid(lambda_grid, t_grid)
 
     return -(ll - integral)
 ```
 
-### 6.4 Total Loss
+### 6.3 Auxiliary Losses
 
 ```python
-L_total = (
-    L_focal                              # primary event prediction
+# Goldstein scale regression (for uncensored survival examples)
+L_goldstein = F.mse_loss(pred["goldstein_pred"], event_goldstein)
+
+# Memory regularization: prevent memory vectors from exploding
+L_mem = lambda_mem * (h_i.norm().pow(2) + h_j.norm().pow(2))  # λ_mem = 0.01
+
+# Gate sparsity: encourage sparse memory updates
+L_gate = lambda_gate * model.get_gate_penalty()  # λ_gate = 0.01
+```
+
+### 6.4 Total Loss
+
+The total loss depends on example type:
+
+```python
+# For survival-target event types (rare/moderate):
+L_survival_example = (
+    L_deephit                            # primary: survival NLL + ranking
     + lambda_1 * L_goldstein             # intensity regression (λ₁ = 0.1)
-    + lambda_2 * L_deephit              # time-to-event (λ₂ = 0.1)
-    + lambda_3 * L_hawkes               # temporal point process (λ₃ = 0.05)
-    + lambda_4 * L_mem_reg              # memory L2 regularization (λ₄ = 0.01)
-    + lambda_5 * L_gate_penalty         # L0 gate sparsity (λ₅ = 0.01)
+    + L_mem + L_gate                     # regularization
+)
+
+# For intensity-target event types (high-frequency):
+L_intensity_example = (
+    L_hawkes_nll                         # primary: Hawkes process NLL
+    + L_mem + L_gate                     # regularization
 )
 ```
+
+Both are weighted by `temporal_weight * event_type_weight` before aggregation.
 
 ---
 
@@ -574,6 +626,6 @@ Every evaluation epoch, save:
 ### 7.3 Best Model Selection
 
 After Phase 3 training completes:
-1. Identify the checkpoint with the best **aggregate validation Brier score** (weighted by event type importance).
+1. Identify the checkpoint with the best **aggregate validation metric**: weighted combination of C-index (survival types) and Hawkes NLL (intensity types), plus Brier score at 30-day horizon derived from the CDF.
 2. Load that checkpoint's weights and memory state.
 3. Pass to Component 6 (Validation & Calibration) for final evaluation on the held-out test set.

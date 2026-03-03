@@ -436,17 +436,17 @@ class TemporalGraphPropagation(nn.Module):
 
 ### 6.1 Dyadic Representation
 
-For a query P(event_type r | actor_i, actor_j, horizon τ):
+The model's primary output is a survival curve over time, not a single probability. The dyadic representation therefore does **not** include a horizon embedding — the full temporal distribution is produced from one forward pass.
 
 ```python
-def build_dyadic_representation(h_i: Tensor, h_j: Tensor, r: int, tau: int) -> Tensor:
+def build_dyadic_representation(h_i: Tensor, h_j: Tensor, r: int) -> Tensor:
     """
-    Construct the feature vector for a prediction query.
+    Construct the feature vector for a dyad-event query.
+    No horizon parameter — the model outputs a full survival curve.
 
     h_i: [d] source actor memory
     h_j: [d] target actor memory
     r: event type index (0–17)
-    tau: prediction horizon in days
     """
     d_ij = torch.cat([
         h_i,                            # [d]    source state
@@ -454,10 +454,9 @@ def build_dyadic_representation(h_i: Tensor, h_j: Tensor, r: int, tau: int) -> T
         h_i * h_j,                      # [d]    element-wise product (symmetric compatibility)
         h_i - h_j,                      # [d]    difference (asymmetry)
         torch.abs(h_i - h_j),           # [d]    absolute difference (distance)
-        time2vec(tau),                   # [time_dim]  horizon encoding
         relation_embeddings[r],         # [d]    relation type embedding
     ])
-    return d_ij  # [5d + time_dim + d] = [6d + time_dim]
+    return d_ij  # [6d]
 ```
 
 **Why these five combinations of h_i and h_j:**
@@ -466,12 +465,25 @@ def build_dyadic_representation(h_i: Tensor, h_j: Tensor, r: int, tau: int) -> T
 - `h_i - h_j`: directional asymmetry — who is more powerful, more Western-aligned, more democratic
 - `|h_i - h_j|`: undirected distance per dimension — how different are they, regardless of direction
 
-### 6.2 Multi-Task Prediction
+### 6.2 Survival Curve Output (Primary)
+
+The primary prediction head outputs a discrete hazard function over K non-uniform time bins, from which the full survival curve and CDF are derived:
 
 ```python
-class EventPredictionHead(nn.Module):
+class SurvivalHead(nn.Module):
+    """
+    Primary output: discrete-time hazard model (DeepHit-style).
+    Outputs hazard at each of K time bins → survival curve → CDF.
+
+    Any fixed-horizon probability query is a CDF lookup.
+    Monotonicity (P(30d) >= P(7d)) is guaranteed by construction.
+    """
+    # Non-uniform time bins: finer near-term, coarser far-term
+    TIME_BIN_BOUNDARIES = [0, 1, 2, 3, 5, 7, 10, 14, 21, 30, 45, 60, 90, 120, 150, 180, 270, 365]
+    K = len(TIME_BIN_BOUNDARIES) - 1  # 17 bins
+
     def __init__(self, input_dim: int, d: int, n_event_types: int = 18):
-        # Shared trunk
+        # Shared trunk: dyadic representation → compressed features
         self.shared = nn.Sequential(
             nn.Linear(input_dim, 4 * d),
             nn.ReLU(),
@@ -480,10 +492,12 @@ class EventPredictionHead(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.1),
         )
-        # Per-event-type heads
-        self.event_heads = nn.ModuleList([
-            nn.Linear(2 * d, 1) for _ in range(n_event_types)
+
+        # Per-event-type hazard heads: each outputs K hazard values
+        self.hazard_heads = nn.ModuleList([
+            nn.Linear(2 * d, self.K) for _ in range(n_event_types)
         ])
+
         # Auxiliary heads
         self.goldstein_head = nn.Linear(2 * d, 1)       # intensity regression
         self.escalation_head = nn.Linear(2 * d, 1)      # binary escalation
@@ -491,36 +505,118 @@ class EventPredictionHead(nn.Module):
     def forward(self, d_ij: Tensor, event_type: int) -> dict:
         trunk = self.shared(d_ij)  # [2d]
 
-        # Event probability
-        logit = self.event_heads[event_type](trunk)  # [1]
-        p_event = torch.sigmoid(logit)
+        # Per-bin hazard: probability of event in bin k, given survival to bin k
+        logits = self.hazard_heads[event_type](trunk)     # [K]
+        hazard = torch.sigmoid(logits)                    # [K], each in (0, 1)
+
+        # Survival function: probability of no event up to end of bin k
+        survival = torch.cumprod(1 - hazard, dim=-1)      # [K]
+
+        # CDF: probability of at least one event by end of bin k
+        cdf = 1 - survival                                # [K]
+
+        # PDF (probability mass per bin): P(event in bin k)
+        survival_shifted = torch.cat([torch.ones(1), survival[:-1]])
+        pdf = hazard * survival_shifted                    # [K]
 
         # Auxiliary predictions
-        goldstein_pred = self.goldstein_head(trunk)   # [1], raw regression
+        goldstein_pred = self.goldstein_head(trunk)        # [1]
         p_escalation = torch.sigmoid(self.escalation_head(trunk))  # [1]
 
         return {
-            "p_event": p_event,
-            "logit": logit,
+            "hazard": hazard,          # [K] per-bin conditional hazard
+            "survival": survival,      # [K] survival function
+            "cdf": cdf,               # [K] cumulative event probability
+            "pdf": pdf,               # [K] probability mass per bin
             "goldstein_pred": goldstein_pred,
             "p_escalation": p_escalation,
         }
+
+    def query_horizon(self, cdf: Tensor, tau_days: float) -> float:
+        """
+        Read off the event probability at an arbitrary horizon.
+        Linearly interpolates between bin boundaries.
+        """
+        boundaries = self.TIME_BIN_BOUNDARIES
+        for k in range(len(boundaries) - 1):
+            if boundaries[k] <= tau_days <= boundaries[k + 1]:
+                # Linear interpolation within bin
+                frac = (tau_days - boundaries[k]) / (boundaries[k + 1] - boundaries[k])
+                cdf_lo = cdf[k - 1] if k > 0 else 0.0
+                cdf_hi = cdf[k]
+                return cdf_lo + frac * (cdf_hi - cdf_lo)
+        return cdf[-1].item()  # beyond last bin
 ```
 
-### 6.3 Hawkes Process for Temporal Intensity
+### 6.3 Hawkes Self-Excitation
 
-For predicting *when* (not just whether) events occur:
+Past events between a dyad increase the near-term hazard (events beget events). The Hawkes excitation term modulates the survival head's base hazard:
 
 ```python
-class HawkesIntensity(nn.Module):
+class HawkesExcitation(nn.Module):
     """
-    Conditional intensity function: rate at which events occur between a dyad,
-    given their current states and event history.
+    Self-excitation component: recent events between a dyad temporarily
+    increase the hazard rate.
 
-    λ(t) = μ(h_i, h_j) + Σ_k α_rk * exp(-β * (t - t_k))
+    The excitation is added to the hazard logits before the sigmoid,
+    so it shifts the survival curve without breaking its monotonicity.
+    """
+    def __init__(self, n_event_types: int = 18):
+        # Per event-type excitation strength and decay rate
+        self.alpha = nn.Parameter(torch.ones(n_event_types, n_event_types) * 0.1)
+        # alpha[r_past, r_predict]: how much a past event of type r_past
+        # excites the hazard for predicting type r_predict
+        self.beta = nn.Parameter(torch.ones(n_event_types) * 0.05)  # decay rate per type
 
-    μ: base rate from actor states
-    Σ: self-excitation from past events (events beget events)
+    def forward(self, event_history: list[tuple], r_predict: int, t0: float, bin_midpoints: Tensor) -> Tensor:
+        """
+        Compute excitation contribution to each time bin's hazard.
+
+        event_history: list of (event_time, event_type) for this dyad
+        r_predict: event type being predicted
+        t0: reference time
+        bin_midpoints: [K] midpoint of each time bin in days from t0
+
+        Returns: [K] excitation values to add to hazard logits
+        """
+        excitation = torch.zeros(len(bin_midpoints))
+
+        for t_k, r_k in event_history:
+            dt = t0 - t_k  # how long ago was this event (days)
+            if dt > 0:
+                # Excitation decays into the future from each past event
+                future_decay = torch.exp(-self.beta[r_k] * (bin_midpoints + dt))
+                excitation += self.alpha[r_k, r_predict] * future_decay
+
+        return excitation  # [K], added to hazard logits
+```
+
+**Integration with the survival head:** The excitation is added to the raw hazard logits *before* the sigmoid, so the full forward pass is:
+
+```python
+# In the combined forward pass:
+logits = hazard_heads[event_type](trunk)                        # base hazard logits [K]
+excitation = hawkes.forward(event_history, event_type, t0, bin_midpoints)  # [K]
+hazard = torch.sigmoid(logits + excitation)                     # modulated hazard [K]
+survival = torch.cumprod(1 - hazard, dim=-1)                   # survival curve
+cdf = 1 - survival                                              # CDF
+```
+
+This means:
+- With no recent event history, the model outputs its "base" survival curve from actor states alone.
+- After a conflict event, the near-term hazard bins spike (self-excitation), pulling the survival curve down faster — reflecting that conflict tends to cluster.
+- The excitation decays over time, so the far-term bins are less affected.
+- Cross-type excitation is possible: a THREATEN event can excite FIGHT hazard (escalation dynamics).
+
+### 6.4 Intensity Output (High-Frequency Events)
+
+For event types modeled as rates rather than time-to-event (CONSULT, ENGAGE, COOP, DISAPPROVE), the Hawkes intensity function is the primary output:
+
+```python
+class IntensityHead(nn.Module):
+    """
+    For high-frequency event types: predict the event rate as a continuous
+    function of time, rather than time-to-first-event.
     """
     def __init__(self, d: int):
         self.base_rate_mlp = nn.Sequential(
@@ -529,52 +625,24 @@ class HawkesIntensity(nn.Module):
             nn.Linear(d, 1),
             nn.Softplus(),  # ensure positive rate
         )
-        self.excitation_weights = nn.Parameter(torch.ones(18) * 0.1)  # per event type
-        self.decay_beta = nn.Parameter(torch.tensor(0.1))  # learnable decay
 
-    def forward(self, h_i: Tensor, h_j: Tensor, event_history: list[tuple], t: float) -> Tensor:
-        # Base rate from current actor states
-        mu = self.base_rate_mlp(torch.cat([h_i, h_j]))
+    def forward(self, h_i: Tensor, h_j: Tensor, event_history: list[tuple],
+                r: int, t0: float, t_query: Tensor) -> Tensor:
+        """
+        Returns: event intensity (rate) at each query time.
+        """
+        # Base rate from actor states
+        mu = self.base_rate_mlp(torch.cat([h_i, h_j]))  # scalar, events/day
 
-        # Self-excitation from historical events
-        excitation = torch.tensor(0.0)
+        # Self-excitation from past events (same as HawkesExcitation but continuous)
+        excitation = torch.zeros_like(t_query)
         for t_k, r_k in event_history:
-            if t_k < t:
-                excitation += self.excitation_weights[r_k] * torch.exp(-self.decay_beta * (t - t_k))
+            dt = t0 + t_query - t_k
+            mask = dt > 0
+            excitation[mask] += self.alpha[r_k, r] * torch.exp(-self.beta[r_k] * dt[mask])
 
-        lambda_t = mu + F.softplus(excitation)
-        return lambda_t
-```
-
-### 6.4 Survival Model (DeepHit)
-
-For time-to-event prediction ("how many days until the next X between i and j?"):
-
-```python
-class DeepHitHead(nn.Module):
-    """
-    Discrete-time hazard model. Outputs hazard at each of K discrete time bins.
-    """
-    def __init__(self, input_dim: int, d: int, n_time_bins: int = 30):
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 2 * d),
-            nn.ReLU(),
-            nn.Linear(2 * d, n_time_bins),
-        )
-        # Time bins: [0-7, 7-14, 14-30, 30-60, 60-90, 90-120, 120-150, 150-180, ...]
-        # Non-uniform binning: finer resolution for near-term, coarser for far-term
-
-    def forward(self, d_ij: Tensor) -> dict:
-        logits = self.mlp(d_ij)                        # [n_time_bins]
-        hazard = torch.sigmoid(logits)                 # [n_time_bins], per-bin hazard
-        survival = torch.cumprod(1 - hazard, dim=-1)   # [n_time_bins], survival function
-        event_cdf = 1 - survival                       # [n_time_bins], cumulative event prob
-
-        return {
-            "hazard": hazard,
-            "survival": survival,
-            "event_cdf": event_cdf,
-        }
+        lambda_t = mu + excitation
+        return lambda_t  # [T], intensity at each query time
 ```
 
 ---
@@ -654,12 +722,11 @@ class Time2Vec(nn.Module):
 
 ### 8.2 Usage
 
-Time2Vec appears in three places:
+Time2Vec appears in two places:
 1. **Text memory update:** encodes the current timestamp to condition the update on where we are in the temporal sequence.
 2. **Event encoding:** encodes the event timestamp for the structured event stream.
-3. **Prediction head:** encodes the forecast horizon τ.
 
-Each use has its own Time2Vec instance with independent learned frequencies, since they encode different temporal concepts (absolute time vs. horizon length).
+Each use has its own Time2Vec instance with independent learned frequencies. The prediction head does not use time2vec because it outputs a full temporal curve rather than a single-horizon prediction.
 
 ---
 
@@ -699,13 +766,13 @@ relation_embeddings.weight.data[:, 1:] = torch.randn(18, d - 1) * 0.01
 | Scalar + dimensional gates | ~0.2M | |
 | GRU source + target | ~1.6M | Two GRU cells, each d × d input |
 | Graph attention (2 layers) | ~2.4M | 18 relations × d² per layer |
-| Prediction head (shared trunk) | ~2.1M | 6d → 4d → 2d |
-| Per-event-type heads (18) | ~9K | 18 × 2d → 1 |
-| Hawkes process | ~0.1M | |
-| DeepHit head | ~0.5M | |
+| Survival head (shared trunk) | ~2.1M | 6d → 4d → 2d |
+| Per-event-type hazard heads (18) | ~156K | 18 × (2d → 17 bins) |
+| Hawkes excitation | ~7K | 18×18 cross-excitation + 18 decay rates |
+| Intensity head (high-freq types) | ~0.2M | Base rate MLP for rate-based types |
 | Relation embeddings | ~5K | 18 × d |
 | Actor baselines | ~0.1M | N_actors × d |
-| Time2Vec (3 instances) | ~100 | Tiny |
+| Time2Vec (2 instances) | ~64 | Tiny |
 | **Total (excluding encoder)** | **~10M** | |
 | **Total (including encoder)** | **~120M** | |
 

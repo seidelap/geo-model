@@ -14,67 +14,83 @@ Define precisely what the model predicts, how positive and negative training exa
 
 ### 1.1 What the Model Predicts
 
-The model answers queries of the form:
+The model's primary output is a **survival curve** (equivalently, a cumulative event probability curve) for each (source actor, target actor, event type) triple:
 
-> **P(event_type r occurs between actor i and actor j within the next τ days)**
+> **S(τ | i, j, r, t₀) = P(no event of type r from actor i to actor j in [t₀, t₀ + τ])**
+
+Or equivalently, the CDF:
+
+> **F(τ | i, j, r, t₀) = 1 − S(τ) = P(at least one event of type r from i to j within τ days)**
+
+This is a function of continuous time τ, not a single number. Any fixed-horizon probability query is a read-off from this curve:
+
+```
+P(event within 7 days)   = F(7)
+P(event within 30 days)  = F(30)
+P(event within 90 days)  = F(90)
+P(event within 180 days) = F(180)
+```
 
 Concretely:
 - **event_type r**: one of the 18 PLOVER categories (AID, AGREE, CONSULT, COOP, DEMAND, DISAPPROVE, ENGAGE, FIGHT, INVESTIGATE, MOBILIZE, PROTEST, REDUCE, REJECT, SANCTION, SEIZE, THREATEN, YIELD, OTHER)
 - **actor i**: source actor (the actor initiating the event)
 - **actor j**: target actor (the actor receiving the event)
-- **τ**: prediction horizon in days
+- **t₀**: reference time ("as of" date)
+- **τ**: any positive real number (days into the future)
 
-The model produces a probability in [0, 1] for each such query.
+### 1.2 Output Representation
 
-### 1.2 Prediction Horizons
-
-The model is trained and evaluated at multiple horizons simultaneously:
-
-| Horizon | τ (days) | Use case |
-|---------|----------|----------|
-| Short-term | 7 | Near-term tactical prediction |
-| Medium-term | 30 | Monthly forecasting, ViEWS benchmark alignment |
-| Long-term | 90 | Quarterly strategic forecasting |
-| Extended | 180 | Long-range outlook |
-
-Each training example generates prediction targets at all four horizons. The prediction head receives τ as an input via a time embedding, so a single model serves all horizons.
-
-### 1.3 Temporal Binning
-
-For a given reference time t₀, the target for horizon τ is:
+The survival curve is represented as a **discrete hazard function** over K non-uniform time bins:
 
 ```
-y(i, j, r, t₀, τ) = 1  if ∃ event of type r from actor i to actor j in [t₀, t₀ + τ]
-                     0  otherwise
+Time bins: [0-1, 1-2, 2-3, 3-5, 5-7, 7-10, 10-14, 14-21, 21-30, 30-45,
+            45-60, 60-90, 90-120, 120-150, 150-180, 180-270, 270-365]
+K = 17 bins
 ```
 
-This is a binary indicator: did at least one event of this type occur in the window?
+Finer resolution for near-term (daily for first 3 days, then widening), coarser for far-term. This non-uniform binning concentrates model capacity where temporal precision matters most.
 
-**For high-frequency event types** (verbal cooperation, diplomatic consultations) where the binary indicator is almost always 1 for active dyads, use count-based targets instead:
-
-```
-y_count(i, j, r, t₀, τ) = count of events of type r from i to j in [t₀, t₀ + τ]
-```
-
-Modeled as a Poisson or negative binomial count (see Section 5).
-
-### 1.4 Determining Which Event Types Use Binary vs. Count Targets
-
-Compute the empirical base rate for each event type across all active dyads:
+From the discrete hazard, all derived quantities are computed:
 
 ```python
-for r in PLOVER_TYPES:
-    base_rate = (number of (i,j,month) triples with ≥1 event of type r) / (total active dyad-months)
-    if base_rate > 0.10:
-        target_type[r] = "count"   # too common for binary to be informative
-    else:
-        target_type[r] = "binary"
+hazard[k]   = P(event in bin k | no event before bin k)    # per-bin hazard
+survival[k] = Π_{j=0}^{k} (1 - hazard[j])                 # survival function
+cdf[k]      = 1 - survival[k]                               # cumulative event probability
+pdf[k]      = hazard[k] * survival[k-1]                     # probability mass in bin k
 ```
 
-Expected classification:
-- **Binary targets:** FIGHT, SANCTION, SEIZE, MOBILIZE, THREATEN, PROTEST, AID, AGREE (rare or moderately rare)
-- **Count targets:** CONSULT, ENGAGE, COOP, DISAPPROVE (common for active dyads)
-- **Borderline:** DEMAND, REDUCE, REJECT, YIELD — evaluate empirically
+To query at an arbitrary continuous time τ, linearly interpolate between the surrounding bin boundaries.
+
+### 1.3 Relationship to Fixed-Horizon Predictions
+
+Fixed-horizon probabilities (7-day, 30-day, etc.) are not separate model outputs — they are lookups on the CDF at the corresponding bin boundary. This means:
+
+- The model is trained once, producing a full temporal curve.
+- All horizon queries are internally consistent (P(30 days) ≥ P(7 days) is guaranteed by the survival function's monotonicity).
+- Benchmark comparisons at specific horizons (e.g., ViEWS monthly) just read the relevant CDF value.
+
+### 1.4 High-Frequency Event Types: Intensity Instead of Time-to-First
+
+For event types where occurrences are frequent (CONSULT, ENGAGE, COOP, DISAPPROVE — base rate >10% per active dyad-month), the time-to-first-event framing is uninformative because the survival curve drops to near zero within days.
+
+For these types, the model additionally outputs an **event intensity** (expected count per unit time) via a Hawkes process:
+
+```
+λ(t) = μ(h_i, h_j, r) + Σ_k α_r · exp(-β_r · (t - t_k))
+
+μ: base rate from actor states (learned)
+Σ: self-excitation from past events (events beget events)
+```
+
+The intensity provides a richer signal: not just "will consultation happen" (almost certainly yes) but "how much more consultation than usual is expected" (deviation from baseline rate).
+
+**Which event types use which framing:**
+
+| Primary framing | Event types | Rationale |
+|----------------|-------------|-----------|
+| Survival curve (time-to-event) | FIGHT, SANCTION, SEIZE, MOBILIZE, THREATEN, AID, AGREE, PROTEST | Rare or moderately rare — when it happens matters |
+| Intensity function (rate) | CONSULT, ENGAGE, COOP, DISAPPROVE | Common — rate variation is the informative signal |
+| Both (survival + intensity) | DEMAND, REDUCE, REJECT, YIELD | Borderline — evaluate empirically which framing performs better |
 
 ---
 
@@ -494,29 +510,34 @@ def event_type_weight(event_type: str, base_frequencies: dict[str, float]) -> fl
 
 ## 8. Training Example Schema
 
-### 8.1 Binary Target Example
+### 8.1 Survival Target Example (Primary)
+
+For event types modeled as time-to-event:
 
 ```python
 @dataclass
-class BinaryTrainingExample:
-    # Prediction query
+class SurvivalTrainingExample:
+    # Dyad and event type
     source_actor_id: str
     target_actor_id: str
     event_type: str              # PLOVER category
     reference_date: date         # t₀: the "as of" date for prediction
-    horizon_days: int            # τ: how far ahead to predict
 
-    # Target
-    label: int                   # 1 if event occurred in [t₀, t₀ + τ], else 0
+    # Target: time to next event
+    event_occurred: bool         # did the event occur within the observation window?
+    days_to_event: float         # days from t₀ to event (if occurred), else days to censoring
+    censored: bool               # True if observation window ended before event occurred
+    time_bin_index: int          # which discrete time bin the event/censoring falls in
 
-    # Metadata for the positive event (if label=1)
+    # Event metadata (if event_occurred)
     event_goldstein: float       # Goldstein score of the actual event
     event_mode: str              # verbal / hypothetical / actual
     event_magnitude_dead: int
     event_magnitude_injured: int
     event_magnitude_size: int
 
-    # Negative sampling metadata (if label=0)
+    # Negative sampling metadata (for corrupted-dyad negatives)
+    is_negative: bool            # True if this is a corrupted negative
     sampling_method: str         # "random" / "hard" / "n/a"
     negative_confidence: float   # how confident this is a true negative [0.5, 1.0]
 
@@ -528,22 +549,29 @@ class BinaryTrainingExample:
     context_window_key: str      # key to look up the context window
 ```
 
-### 8.2 Count Target Example
+**Censoring:** When the observation window ends (at the train/val/test boundary) before an event occurs, the example is right-censored. The model learns that the event hadn't happened *yet* — it may or may not happen after the window. Survival models handle censoring natively; this is a core advantage over binary classification, which must discard or arbitrarily label censored examples.
+
+### 8.2 Intensity Target Example
+
+For event types modeled as rates (high-frequency types):
 
 ```python
 @dataclass
-class CountTrainingExample:
+class IntensityTrainingExample:
     source_actor_id: str
     target_actor_id: str
     event_type: str
     period_start: date
     period_end: date
-    observed_count: int
+    event_times: list[float]     # list of exact event times within the period (days from period_start)
+    event_count: int             # len(event_times)
     mean_goldstein: float
     temporal_weight: float
     event_type_weight: float
     context_window_key: str
 ```
+
+The intensity model is trained on the exact event times within each period, using the Hawkes process NLL (see Component 5).
 
 ---
 

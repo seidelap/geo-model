@@ -44,15 +44,19 @@ def evaluate(model: FullModel, test_data: TestDataset, calibration_params: dict)
 
         # Predict for all test queries at this reference date
         for query in test_data.queries_at(reference_date):
-            raw_pred = model.predict(query.source, query.target, query.event_type, query.horizon)
+            # Model outputs a full survival curve, not a single probability
+            event_history = get_dyad_event_history(query.source, query.target)
+            survival_curve = model.predict_survival(
+                query.source, query.target, query.event_type, event_history
+            )
 
-            # Apply calibration
-            cal_pred = calibrate(raw_pred, query.event_type, calibration_params)
+            # Apply calibration (per-bin temperature scaling)
+            cal_curve = calibrate_curve(survival_curve, query.event_type, calibration_params)
 
-            predictions[query.id] = cal_pred
-            actuals[query.id] = query.actual_label
+            predictions[query.id] = cal_curve  # full CDF
+            actuals[query.id] = query.actual_event_time  # days to event, or censored
 
-    # 3. Compute metrics
+    # 3. Compute metrics (survival metrics + derived fixed-horizon Brier)
     return compute_all_metrics(predictions, actuals, test_data)
 ```
 
@@ -70,20 +74,90 @@ Report both modes.
 
 ## 2. Primary Metrics
 
-### 2.1 Brier Score (BS)
+The model outputs survival curves, not single probabilities. Evaluation uses both **survival-native metrics** (which evaluate the full temporal distribution) and **derived fixed-horizon metrics** (which evaluate CDF read-offs at standard horizons for comparability with baselines and benchmarks).
+
+### 2.1 Concordance Index (C-index) — Survival-Native
 
 ```python
-def brier_score(predictions: list[float], actuals: list[int]) -> float:
+def concordance_index(predicted_cdfs: list[Tensor], actual_times: list[float], censored: list[bool]) -> float:
     """
-    Mean squared error of probabilistic forecasts. Lower is better. Range [0, 1].
-    Strictly proper scoring rule: minimized when predicted probabilities equal true probabilities.
+    Fraction of comparable pairs where the model correctly ranks who experiences
+    the event first. C-index = 0.5 is random, 1.0 is perfect ordering.
+
+    A pair (i, j) is comparable if i's event time < j's event time and i is uncensored.
+    The model is concordant if it assigns higher CDF (higher risk) to i than j
+    at the time of i's event.
     """
+    concordant, discordant, tied = 0, 0, 0
+    for i in range(len(actual_times)):
+        if censored[i]:
+            continue
+        for j in range(len(actual_times)):
+            if i == j or actual_times[j] <= actual_times[i]:
+                continue
+            # i experienced the event before j
+            risk_i = interpolate_cdf(predicted_cdfs[i], actual_times[i])
+            risk_j = interpolate_cdf(predicted_cdfs[j], actual_times[i])
+            if risk_i > risk_j:
+                concordant += 1
+            elif risk_i < risk_j:
+                discordant += 1
+            else:
+                tied += 1
+    return (concordant + 0.5 * tied) / max(concordant + discordant + tied, 1)
+```
+
+**Target:** C-index ≥ 0.70 per event type. Report macro-averaged across event types.
+
+### 2.2 Integrated Brier Score (IBS) — Survival-Native
+
+```python
+def integrated_brier_score(predicted_cdfs: list[Tensor], actual_times: list[float],
+                           censored: list[bool], t_max: float = 365) -> float:
+    """
+    Time-integrated Brier score: evaluates the full survival curve, not just a single horizon.
+    IBS = (1/t_max) * integral_0^t_max BS(t) dt
+
+    BS(t) = (1/N) * Σ_i [F_i(t) - I(T_i <= t)]^2 * W_i(t)
+
+    where W_i(t) is an inverse-probability-of-censoring weight (IPCW) to handle
+    censored observations.
+    """
+    t_grid = np.linspace(0, t_max, 200)
+    bs_values = []
+    for t in t_grid:
+        sq_errors = []
+        for i in range(len(actual_times)):
+            predicted_cdf_at_t = interpolate_cdf(predicted_cdfs[i], t)
+            actual_indicator = float(actual_times[i] <= t and not censored[i])
+            sq_errors.append((predicted_cdf_at_t - actual_indicator) ** 2)
+        bs_values.append(np.mean(sq_errors))
+    return np.trapz(bs_values, t_grid) / t_max
+```
+
+IBS evaluates the *entire* curve rather than cherry-picking horizons. Lower is better.
+
+### 2.3 Fixed-Horizon Brier Score (Derived)
+
+Fixed-horizon Brier scores are derived from the survival CDF for comparability with baselines and benchmarks:
+
+```python
+def fixed_horizon_brier(predicted_cdfs: list[Tensor], actual_times: list[float],
+                        horizon_days: float) -> float:
+    """
+    Standard Brier score at a specific horizon, derived from the survival CDF.
+
+    prediction = CDF(horizon_days) = P(event within horizon_days)
+    actual = 1 if event occurred within horizon_days, else 0
+    """
+    predictions = [interpolate_cdf(cdf, horizon_days) for cdf in predicted_cdfs]
+    actuals = [1 if t <= horizon_days else 0 for t in actual_times]
     return np.mean([(p - y) ** 2 for p, y in zip(predictions, actuals)])
 ```
 
-Report per event type and aggregated (macro-average across event types, not micro-average across examples, to avoid domination by common types).
+Report at standard horizons (7, 30, 90, 180 days) for comparison with Phase 0 LightGBM and external benchmarks. These are not separate predictions — they are read-offs from the same survival curve, so consistency (P(30d) ≥ P(7d)) is guaranteed.
 
-### 2.2 Brier Skill Score (BSS)
+### 2.4 Brier Skill Score (BSS)
 
 ```python
 def brier_skill_score(bs_model: float, bs_baseline: float) -> float:
@@ -94,47 +168,53 @@ def brier_skill_score(bs_model: float, bs_baseline: float) -> float:
     return 1.0 - bs_model / bs_baseline
 ```
 
-Compute BSS against three baselines:
+Compute BSS at the 30-day horizon (primary) against three baselines:
 1. **Climatological baseline:** Always predict the historical base rate for each event type.
 2. **No-change baseline:** Predict that whatever happened last month will happen this month. (Surprisingly strong — see ViEWS competition results.)
 3. **Phase 0 LightGBM:** The tabular baseline from Component 5.
 
-### 2.3 Log Loss
+### 2.5 Log Loss (Derived)
 
 ```python
-def log_loss(predictions: list[float], actuals: list[int], eps: float = 1e-7) -> float:
+def log_loss_at_horizon(predicted_cdfs: list[Tensor], actual_times: list[float],
+                        horizon_days: float, eps: float = 1e-7) -> float:
     """
-    Negative log-likelihood. More sensitive than Brier to confident wrong predictions.
+    Negative log-likelihood at a specific horizon, derived from the CDF.
+    More sensitive than Brier to confident wrong predictions.
     """
-    preds = np.clip(predictions, eps, 1 - eps)
-    return -np.mean([y * np.log(p) + (1 - y) * np.log(1 - p) for p, y in zip(preds, actuals)])
+    predictions = [np.clip(interpolate_cdf(cdf, horizon_days), eps, 1 - eps) for cdf in predicted_cdfs]
+    actuals = [1 if t <= horizon_days else 0 for t in actual_times]
+    return -np.mean([y * np.log(p) + (1 - y) * np.log(1 - p) for p, y in zip(predictions, actuals)])
 ```
 
-Log loss penalizes confident wrong predictions catastrophically. A model that says P=0.99 when the actual outcome is 0 gets a huge penalty. This matters for deployment: overconfident wrong predictions are dangerous.
-
-### 2.4 Precision-Recall AUC (PR-AUC)
+### 2.6 Precision-Recall AUC (PR-AUC, Derived)
 
 ```python
 from sklearn.metrics import average_precision_score
 
-def pr_auc(predictions: list[float], actuals: list[int]) -> float:
+def pr_auc_at_horizon(predicted_cdfs: list[Tensor], actual_times: list[float],
+                      horizon_days: float) -> float:
     """
-    Area under the precision-recall curve. Appropriate for imbalanced/rare events.
-    NOT ROC-AUC, which is misleading when true negatives dominate.
+    PR-AUC at a specific horizon, derived from the CDF.
+    Appropriate for rare events where ROC-AUC is misleading.
     """
+    predictions = [interpolate_cdf(cdf, horizon_days) for cdf in predicted_cdfs]
+    actuals = [1 if t <= horizon_days else 0 for t in actual_times]
     return average_precision_score(actuals, predictions)
 ```
 
-Report PR-AUC per event type. For rare events (FIGHT, SEIZE), this is more informative than accuracy or ROC-AUC.
-
-### 2.5 Expected Calibration Error (ECE)
+### 2.7 Expected Calibration Error (ECE, Derived)
 
 ```python
-def expected_calibration_error(predictions: list[float], actuals: list[int], n_bins: int = 15) -> float:
+def ece_at_horizon(predicted_cdfs: list[Tensor], actual_times: list[float],
+                   horizon_days: float, n_bins: int = 15) -> float:
     """
-    Measures how well predicted probabilities match empirical frequencies.
-    Perfect calibration: ECE = 0.
+    ECE at a specific horizon. Measures whether CDF(horizon) matches
+    empirical event frequency at that horizon.
     """
+    predictions = [interpolate_cdf(cdf, horizon_days) for cdf in predicted_cdfs]
+    actuals = [1 if t <= horizon_days else 0 for t in actual_times]
+
     bins = np.linspace(0, 1, n_bins + 1)
     ece = 0.0
     for bin_lower, bin_upper in zip(bins[:-1], bins[1:]):
@@ -146,70 +226,97 @@ def expected_calibration_error(predictions: list[float], actuals: list[int], n_b
     return ece
 ```
 
-ECE is reported before and after calibration (Section 3) to quantify calibration improvement.
+ECE is reported at each standard horizon (7, 30, 90, 180 days), before and after calibration.
 
 ---
 
 ## 3. Calibration
 
-### 3.1 Temperature Scaling
+### 3.1 Per-Bin Temperature Scaling
 
-Post-hoc calibration using a per-event-type learned temperature (Guo et al., ICML 2017):
+The survival curve consists of K hazard logits per time bin. Calibrate by applying a learned temperature per event type per time bin on the validation set:
 
 ```python
-def fit_temperature(val_logits: Tensor, val_labels: Tensor) -> float:
+def fit_bin_temperatures(val_hazard_logits: Tensor, val_event_bins: Tensor,
+                         val_censored: Tensor, K: int) -> Tensor:
     """
-    Find the temperature T that minimizes NLL on the validation set.
-    T > 1 softens (reduces confidence), T < 1 sharpens.
+    Fit per-bin temperatures that minimize the DeepHit NLL on the validation set.
+
+    val_hazard_logits: [N_val, K] raw hazard logits
+    val_event_bins: [N_val] observed time bin per example
+    val_censored: [N_val] censoring indicators
+
+    Returns: [K] temperatures, one per time bin
     """
-    T = nn.Parameter(torch.tensor(1.5))
-    optimizer = optim.LBFGS([T], lr=0.01, max_iter=50)
+    T = nn.Parameter(torch.ones(K) * 1.5)
+    optimizer = optim.LBFGS([T], lr=0.01, max_iter=100)
 
     def closure():
         optimizer.zero_grad()
-        loss = F.binary_cross_entropy_with_logits(val_logits / T, val_labels.float())
+        calibrated_hazard = torch.sigmoid(val_hazard_logits / T.unsqueeze(0))
+        survival = torch.cumprod(1 - calibrated_hazard, dim=-1)
+        survival_shifted = torch.cat([torch.ones(len(survival), 1), survival[:, :-1]], dim=1)
+        pdf = calibrated_hazard * survival_shifted
+
+        loss = 0.0
+        for i in range(len(val_event_bins)):
+            if not val_censored[i]:
+                loss -= torch.log(pdf[i, val_event_bins[i]] + 1e-8)
+            else:
+                loss -= torch.log(survival[i, val_event_bins[i]] + 1e-8)
+        loss /= len(val_event_bins)
         loss.backward()
         return loss
 
     optimizer.step(closure)
-    return T.item()
+    return T.detach()
 
-# Fit one temperature per event type
-temperature = {}
+# Fit temperatures per event type
+bin_temperatures = {}
 for r in PLOVER_TYPES:
-    val_logits_r = get_val_logits(r)
-    val_labels_r = get_val_labels(r)
-    temperature[r] = fit_temperature(val_logits_r, val_labels_r)
+    bin_temperatures[r] = fit_bin_temperatures(
+        val_hazard_logits[r], val_event_bins[r], val_censored[r], K
+    )
 
-# Apply at test time
-def calibrate(raw_logit: float, event_type: str, temperature: dict) -> float:
-    T = temperature[event_type]
-    return sigmoid(raw_logit / T)
+# Apply at test time: divide hazard logits by temperature before sigmoid
+def calibrate_curve(raw_logits: Tensor, event_type: str, bin_temperatures: dict) -> dict:
+    T = bin_temperatures[event_type]
+    hazard = torch.sigmoid(raw_logits / T)
+    survival = torch.cumprod(1 - hazard, dim=-1)
+    cdf = 1 - survival
+    return {"hazard": hazard, "survival": survival, "cdf": cdf}
 ```
 
-**Why per-event-type:** Rare events (FIGHT: base rate ~0.1%) and common events (CONSULT: base rate ~15%) have fundamentally different calibration profiles. A single global temperature cannot correct both.
+**Why per-bin:** The model may be systematically overconfident at near-term horizons (hazard too high in early bins) but well-calibrated at long-term horizons, or vice versa. Per-bin temperatures correct this.
+
+**Fallback (simpler):** A single temperature per event type applied to all bins. Faster to fit, less expressive. Use as a starting point; upgrade to per-bin if calibration varies significantly across the curve.
 
 ### 3.2 Calibration Validation
 
-After fitting temperatures on the validation set, verify on the test set:
+After fitting temperatures on the validation set, evaluate ECE at each standard horizon on the test set:
 
 | Metric | Pre-calibration | Post-calibration | Target |
 |--------|----------------|-----------------|--------|
-| ECE (macro avg) | Measure | Measure | < 0.05 |
-| ECE per type (worst) | Measure | Measure | < 0.10 |
+| ECE at 7 days | Measure | Measure | < 0.05 |
+| ECE at 30 days | Measure | Measure | < 0.05 |
+| ECE at 90 days | Measure | Measure | < 0.05 |
+| ECE at 180 days | Measure | Measure | < 0.05 |
+| ECE worst (any type × horizon) | Measure | Measure | < 0.10 |
 
-If post-calibration ECE > 0.10 for any event type, investigate: the model may be systematically biased for that type.
+If post-calibration ECE > 0.10 for any event type at any horizon, investigate: the model may be systematically biased for that type/horizon combination.
 
 ### 3.3 Reliability Diagrams
 
-For each event type, produce a reliability diagram:
-- X-axis: predicted probability (binned)
-- Y-axis: observed frequency within that bin
+For each event type, produce reliability diagrams **at each standard horizon** (7, 30, 90, 180 days):
+- X-axis: predicted CDF(horizon) (binned)
+- Y-axis: observed event frequency within that bin at that horizon
 - Perfect calibration: points lie on the diagonal
-- Overconfident: points below the diagonal (model predicts higher probability than observed)
+- Overconfident: points below the diagonal (predicted probability too high)
 - Underconfident: points above the diagonal
 
-Generate these diagrams for: (a) the full test set, (b) the first 6 months of test, (c) the last 6 months of test. If calibration degrades over time, the model may be drifting and needs more frequent recalibration.
+Additionally, produce **survival curve comparison plots**: overlay the average predicted survival curve against the Kaplan-Meier empirical survival curve for each event type. These should be close if the model is well-calibrated across the full temporal range, not just at fixed horizons.
+
+Generate diagrams for: (a) the full test set, (b) the first 6 months of test, (c) the last 6 months of test. If calibration degrades over time, the model may be drifting and needs more frequent recalibration.
 
 ---
 
@@ -231,12 +338,12 @@ The ViEWS platform (`github.com/views-platform`) provides standardized conflict 
 
 **Comparison methodology:**
 1. Collect resolved Polymarket geopolitical questions from the test period.
-2. For each question, manually map to relevant (actor_i, actor_j, event_type, horizon) queries.
-3. Query our model at the time the Polymarket question opened.
-4. Compute head-to-head Brier scores: our prediction vs. Polymarket's implied probability at the same time.
+2. For each question, manually map to relevant (actor_i, actor_j, event_type) queries and compute the corresponding horizon from the question's resolution date.
+3. Query our model's survival CDF at the time the Polymarket question opened, reading off the CDF at the question's horizon.
+4. Compute head-to-head Brier scores: our CDF(horizon) vs. Polymarket's implied probability at the same time.
 
 **Challenges:**
-- Polymarket questions are specific and nuanced ("Will Russia and Ukraine sign a ceasefire before December 31, 2023?"), while our model predicts generic event types ("AGREE between state:RUS and state:UKR within 180 days"). The mapping is imperfect.
+- Polymarket questions are specific and nuanced ("Will Russia and Ukraine sign a ceasefire before December 31, 2025?"), while our model predicts generic event types. The mapping is imperfect, but the survival curve makes it natural — the question's deadline maps directly to a CDF read-off.
 - Polymarket questions are non-randomly selected (biased toward salient, uncertain events). Report comparisons on the full question set and stratified by salience/liquidity.
 - Small sample size: Polymarket may have only 20–50 resolved geopolitical questions in a given year. Statistical power is limited.
 
@@ -276,15 +383,19 @@ For each of the 18 PLOVER event types, report:
 
 | Metric | Value | Comparison |
 |--------|-------|------------|
-| Base rate (test set) | % | — |
-| Brier Score | | vs. Phase 0 |
-| BSS vs. climatological | | positive = good |
-| BSS vs. no-change | | positive = good |
-| BSS vs. Phase 0 (LightGBM) | | positive = neural beats tabular |
-| Log Loss | | vs. Phase 0 |
-| PR-AUC | | vs. Phase 0 |
-| ECE (post-calibration) | | < 0.05 target |
-| Temperature T_r | | >1 = overconfident, <1 = underconfident |
+| Target type | survival / intensity | — |
+| Base rate at 30d (test set) | % | — |
+| C-index | | ≥ 0.70 target |
+| IBS (integrated Brier) | | vs. Phase 0 |
+| Brier at 7d (derived from CDF) | | vs. Phase 0 |
+| Brier at 30d (derived from CDF) | | vs. Phase 0 |
+| Brier at 90d (derived from CDF) | | vs. Phase 0 |
+| BSS at 30d vs. climatological | | positive = good |
+| BSS at 30d vs. no-change | | positive = neural beats persistence |
+| BSS at 30d vs. Phase 0 (LightGBM) | | positive = neural beats tabular |
+| PR-AUC at 30d | | vs. Phase 0 |
+| ECE at 30d (post-calibration) | | < 0.05 target |
+| Mean predicted vs. Kaplan-Meier | | visual agreement |
 
 ### 5.2 Error Analysis Categories
 
@@ -330,13 +441,13 @@ Test sensitivity to key hyperparameters:
 
 | Hyperparameter | Test values | Metric to watch |
 |----------------|-------------|-----------------|
-| Embedding dimension d | 128, 256, 512 | Aggregate BSS |
-| Memory decay half-life | 30, 90, 180, 365 days | Late-test-period BSS |
-| TBPTT window K | 25, 50, 75, 100 | Aggregate BSS + training stability |
-| Negative sampling ratio K_neg | 5, 10, 20 | PR-AUC on rare events |
-| Hard negative ratio | 0.0, 0.15, 0.30 | PR-AUC on rare events |
-| Graph attention layers | 1, 2, 3 | BSS on second-order effects |
-| Focal loss gamma | 0, 1, 2, 3 | PR-AUC on rare events |
+| Embedding dimension d | 128, 256, 512 | C-index + IBS |
+| Memory decay half-life | 30, 90, 180, 365 days | Late-test-period C-index |
+| TBPTT window K | 25, 50, 75, 100 | C-index + training stability |
+| Negative sampling ratio K_neg | 5, 10, 20 | C-index on rare events |
+| Hard negative ratio | 0.0, 0.15, 0.30 | C-index on rare events |
+| Graph attention layers | 1, 2, 3 | IBS on second-order effects |
+| Number of time bins K | 10, 17, 30 | IBS (more bins = finer curve, but more parameters) |
 
 ---
 
@@ -346,11 +457,11 @@ Test sensitivity to key hyperparameters:
 
 Evaluate on multiple test periods (Component 3, Section 6.2):
 
-| Test period | Brier | BSS vs. baseline | Notes |
-|-------------|-------|-------------------|-------|
-| 2025-04 – 2026-03 (primary) | | | Primary evaluation |
-| 2024-04 – 2025-03 (robustness 1) | | | Should be similar |
-| 2023-04 – 2024-03 (robustness 2) | | | Should be similar |
+| Test period | C-index | IBS | BSS at 30d | Notes |
+|-------------|---------|-----|------------|-------|
+| 2025-04 – 2026-03 (primary) | | | | Primary evaluation |
+| 2024-04 – 2025-03 (robustness 1) | | | | Should be similar |
+| 2023-04 – 2024-03 (robustness 2) | | | | Should be similar |
 
 If performance varies drastically across test periods, the model may be fitting to temporal artifacts rather than learning stable geopolitical dynamics.
 
@@ -358,11 +469,11 @@ If performance varies drastically across test periods, the model may be fitting 
 
 Stratify evaluation by actor data density:
 
-| Actor category | Dyad count | Brier | BSS |
-|----------------|------------|-------|-----|
-| Dense-Dense (G7 × G7) | | | Expected: best performance |
-| Dense-Sparse (G7 × small state) | | | Expected: moderate |
-| Sparse-Sparse (small × small) | | | Expected: weakest |
+| Actor category | Dyad count | C-index | IBS | BSS at 30d |
+|----------------|------------|---------|-----|------------|
+| Dense-Dense (G7 × G7) | | | | Expected: best performance |
+| Dense-Sparse (G7 × small state) | | | | Expected: moderate |
+| Sparse-Sparse (small × small) | | | | Expected: weakest |
 
 The model should degrade gracefully with data sparsity, not catastrophically. If Sparse-Sparse performance is worse than the climatological baseline, the model is not generalizing to sparse actors and those predictions should not be trusted.
 
