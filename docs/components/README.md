@@ -47,7 +47,7 @@ These components cover everything needed to produce a trained, validated model. 
 | 1 | [Training Data Curation](01-training-data-curation.md) | `01-training-data-curation.md` | Ingest, filter, normalize, and store raw data from all sources |
 | 2 | [Actor Registry & Initialization](02-actor-registry.md) | `02-actor-registry.md` | Define the actor set, collect structural features, bootstrap embeddings |
 | 3 | [Target Event Definition](03-target-event-definition.md) | `03-target-event-definition.md` | Define prediction targets, construct train/val/test datasets, negative sampling |
-| 4 | [Model Architecture](04-model-architecture.md) | `04-model-architecture.md` | The 6-layer neural architecture: memory, text stream, event stream, graph, prediction, calibration |
+| 4 | [Model Architecture](04-model-architecture.md) | `04-model-architecture.md` | The 6-layer neural architecture: memory, text stream, event stream, actor self-attention, prediction, calibration |
 | 5 | [Training Pipeline](05-training-pipeline.md) | `05-training-pipeline.md` | Multi-phase training: tabular baseline → structural pretrain → self-supervised → supervised |
 | 6 | [Model Validation & Calibration](06-model-validation.md) | `06-model-validation.md` | Metrics, evaluation protocol, calibration, benchmark comparisons |
 

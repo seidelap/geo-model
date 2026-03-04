@@ -313,7 +313,7 @@ All parameters are trainable, with different learning rates:
 |-----------|--------------|-----------|
 | ConfliBERT encoder | 1e-5 | Small LR: preserve pretraining; just fine-tune |
 | Memory update parameters | 5e-4 | Medium: needs to adapt to supervised signal |
-| Graph attention layers | 5e-4 | Medium: new component, learning from scratch |
+| Actor self-attention layers | 5e-4 | Medium: new component, learning from scratch |
 | Survival/hazard heads | 1e-3 | Larger: top-level heads, most supervised gradient |
 | Hawkes excitation parameters | 1e-3 | Larger: learning temporal dynamics |
 | Intensity head (high-freq types) | 1e-3 | Larger: learning rate dynamics |
@@ -321,7 +321,7 @@ All parameters are trainable, with different learning rates:
 
 ### 5.3 Training Loop: Chronological Rollout
 
-Training processes the full training period day by day. Within each day, events and articles update actor memories. At the end of each day, graph propagation runs. Prediction losses are computed at TBPTT boundaries.
+Training processes the full training period day by day. Within each day, events and articles update actor memories. At the end of each day, actor self-attention runs. Prediction losses are computed at TBPTT boundaries.
 
 ```python
 def phase3_epoch(model: FullModel, data: ChronologicalStream, K: int = 75):
@@ -332,7 +332,7 @@ def phase3_epoch(model: FullModel, data: ChronologicalStream, K: int = 75):
       1. Activate/deactivate actors whose lifecycle boundaries fall on this day
       2. Process all articles for this day (Layer 2)
       3. Process all structured events for this day (Layer 3)
-      4. Run graph propagation (Layer 4)
+      4. Run actor self-attention (Layer 4)
       5. At TBPTT boundaries: compute losses, backprop, update parameters
     """
     # --- Epoch initialization (see Component 4, Section 11) ---
@@ -377,9 +377,9 @@ def phase3_epoch(model: FullModel, data: ChronologicalStream, K: int = 75):
                 model.t_last[event.target_actor_id] = day.date
             memory_step_count += 1
 
-        # --- 4. Graph propagation (once per day, Layer 4) ---
-        active_H, active_edges = build_active_subgraph(model.H, active_actors, day.date)
-        updated_H = model.graph_propagation(active_H, *active_edges)
+        # --- 4. Actor self-attention (once per day, Layer 4) ---
+        active_H = gather_active(model.H, active_actors)
+        updated_H = model.actor_propagation(active_H)
         write_back_active(model.H, updated_H, active_actors)
 
         # --- 5. TBPTT: compute losses and backprop at boundaries ---
@@ -414,7 +414,7 @@ def activate_actor(model: FullModel, actor: Actor, date: date):
     # The actor now participates in:
     # - Text processing: its sketch vector is included in relevance filtering
     # - Event processing: events involving it trigger GRU updates
-    # - Graph propagation: it receives messages from neighbors
+    # - Actor self-attention: it attends to and is attended by all other active actors
     # - Prediction queries: dyads involving it are now queryable
 ```
 
@@ -430,19 +430,18 @@ def deactivate_actor(model: FullModel, actor: Actor, date: date):
     Remove an actor from active participation during the training rollout.
 
     The actor's memory is frozen but retained — it is needed for
-    historical graph edges and for any training examples that reference
-    this actor's state at earlier time points.
+    any training examples that reference this actor's state at
+    earlier time points.
     """
     # Freeze: stop updating this actor's memory
     model.H[actor.actor_id] = model.H[actor.actor_id].detach()
 
     # The actor no longer participates in:
     # - New text/event processing (no more memory updates)
-    # - Graph propagation (excluded from active subgraph)
+    # - Actor self-attention (excluded from active set)
     # - New prediction queries (dyads involving it are not sampled)
     #
     # But its frozen state is still available:
-    # - As a graph neighbor for historical edge construction
     # - As source/target state for loss computation on examples
     #   with reference dates before the deactivation
 ```

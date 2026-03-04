@@ -428,7 +428,7 @@ Test the contribution of each model component by removing it and measuring perfo
 |----------|---------------|-----------------|
 | No text stream | Remove Layer 2, rely only on structured events | Moderate degradation, especially for events with textual precursors |
 | No event stream | Remove Layer 3, rely only on text | Moderate degradation, especially for high-frequency events |
-| No graph propagation | Remove Layer 4 | Small-moderate degradation, mainly for second-order effects |
+| No actor self-attention | Remove Layer 4 | Small-moderate degradation, mainly for second-order effects |
 | No Hawkes process | Remove temporal self-excitation | Degradation on bursty event types (FIGHT, PROTEST) |
 | No curriculum learning | Full event-type weights from step 0 | Possible degradation on rare events |
 | No temporal decay | Remove memory decay (λ=0) | Memories become stale; late-test performance degrades |
@@ -446,7 +446,7 @@ Test sensitivity to key hyperparameters:
 | TBPTT window K | 25, 50, 75, 100 | C-index + training stability |
 | Negative sampling ratio K_neg | 5, 10, 20 | C-index on rare events |
 | Hard negative ratio | 0.0, 0.15, 0.30 | C-index on rare events |
-| Graph attention layers | 1, 2, 3 | IBS on second-order effects |
+| Self-attention layers | 1, 2, 3 | IBS on second-order effects |
 | Number of time bins K | 10, 17, 30 | IBS (more bins = finer curve, but more parameters) |
 
 ---

@@ -16,12 +16,12 @@ Define the neural network architecture that transforms curated data into event p
 Layer 1: Actor Memory Store      Persistent state vectors h_i(t) ∈ R^d per actor
 Layer 2: Text Processing Stream  Updates memory from news articles (high latency, high richness)
 Layer 3: Structured Event Stream Updates memory from coded events (low latency, lower richness)
-Layer 4: Temporal Graph           Propagates information across the actor network periodically
+Layer 4: Actor Self-Attention     Propagates information across all actors via full self-attention
 Layer 5: Event Prediction Head    Produces event probabilities from actor state pairs
 Layer 6: Calibration             Post-hoc probability correction
 ```
 
-Layers 2 and 3 run in parallel, both writing to Layer 1. Layer 4 runs periodically (daily/weekly). Layers 5 and 6 are invoked at query time.
+Layers 2 and 3 run in parallel, both writing to Layer 1. Layer 4 runs once per simulated day. Layers 5 and 6 are invoked at query time.
 
 **Key hyperparameter:** d = embedding dimension. Start with d=256. Scale to d=512 if capacity is insufficient.
 
@@ -175,9 +175,9 @@ def actor_reads_document(
 1. **Name encoding** (from `h_baseline_i`, see Component 2, Section 3.5): Gives lexical affinity — Russia's query attends more to tokens like "Russia", "Moscow", "Kremlin" because its baseline encodes its name through ConfliBERT. This persists through decay: even after long periods without updates, the baseline (and thus the name signal) remains.
 2. **Accumulated memory** (`h_i`): Encodes the actor's full recent history from both streams. A country that just processed a FIGHT event via the GRU (Layer 3) has a different memory state than one processing COOP events — and this shifts its attention pattern when reading the next article.
 
-**Cross-stream interaction via shared memory:** The text and event streams don't need an explicit bridge because they write to the same `h_i`. Within each simulated day (see Component 5, Section 5.3), the processing order is: articles first (Layer 2), then structured events (Layer 3), then graph propagation (Layer 4). Each step sees the cumulative effect of all prior steps that day. Across days, the previous day's event-stream updates are fully reflected in `h_i` when the next day's articles are read.
+**Cross-stream interaction via shared memory:** The text and event streams don't need an explicit bridge because they write to the same `h_i`. Within each simulated day (see Component 5, Section 5.3), the processing order is: articles first (Layer 2), then structured events (Layer 3), then actor self-attention (Layer 4). Each step sees the cumulative effect of all prior steps that day. Across days, the previous day's event-stream updates are fully reflected in `h_i` when the next day's articles are read.
 
-**Role-specific projections (Q/K/V):** The single memory vector `h_i` serves multiple roles — as a query when reading documents, as a key/value when participating in graph propagation, and as input to the prediction head. Learned projection matrices (W_Q, W_K, W_V, etc.) create role-specific views of the same underlying state. This is the standard transformer approach: one representation, multiple projections. If capacity becomes a bottleneck (e.g., graph propagation quality degrades text reading), we can split into separate vectors later, but the single-vector design is simpler and avoids the question of which vector the GRU writes to.
+**Role-specific projections (Q/K/V):** The single memory vector `h_i` serves multiple roles — as a query when reading documents, as a key/value when participating in actor self-attention, and as input to the prediction head. Learned projection matrices (W_Q, W_K, W_V, etc.) create role-specific views of the same underlying state. This is the standard transformer approach: one representation, multiple projections. If capacity becomes a bottleneck (e.g., self-attention quality degrades text reading), we can split into separate vectors later, but the single-vector design is simpler and avoids the question of which vector the GRU writes to.
 
 **Why this works for new entities:** A newly added actor starts with `h_baseline_i`, which includes the name encoding (lexical anchor) and structural/text-derived features (neighborhood anchor). The first few articles and events rapidly specialize the memory from there.
 
@@ -300,125 +300,88 @@ No explicit fusion logic is needed. The shared memory and learned gates handle i
 
 ---
 
-## 5. Layer 4: Temporal Graph Propagation
+## 5. Layer 4: Actor Self-Attention
 
 ### 5.1 Purpose
 
-Propagate information across the actor network periodically. Captures second-order effects: if Germany and France have a major summit, the France-Algeria relationship is also affected through linkages.
+Propagate information across the full actor population. Captures second-order effects: if Germany and France have a major summit, the France-Algeria relationship is also affected even if no direct event was coded between them.
+
+**Design choice:** Every actor attends to every other actor via standard multi-head self-attention (a transformer block over the actor "sequence"). There is no explicit graph construction — no edges, no typed adjacency, no sparsity mask. The model learns which actors should attend to which entirely from data.
+
+**Why full attention instead of sparse graph edges:**
+1. **N is small.** With 500–2000 actors, full self-attention is O(N² × d) — a single matrix multiply on GPU, negligible compared to encoding thousands of articles through ConfliBERT.
+2. **Text-informed topology.** Actors discussed together in articles develop correlated memories, and attention picks this up — even with zero coded PLOVER events between them.
+3. **Emergent typed interactions.** With multi-head attention, different heads can specialize (cooperative vs. adversarial relationships), giving the equivalent of typed edges without hand-coding 18 PLOVER categories into the propagation structure.
+4. **Multi-hop for free.** Stacking 2–3 transformer layers gives multi-hop propagation without explicit message-passing rounds.
 
 ### 5.2 Execution Schedule
 
-Run graph propagation **once per simulated day**, in both training and inference. This ensures identical cadence — the model never sees a different graph update rhythm than what it will encounter in production.
+Run actor self-attention **once per simulated day**, in both training and inference. This ensures identical cadence — the model never sees a different update rhythm than what it will encounter in production.
 
 - **During training:** At the end of each simulated day in the chronological rollout, after processing all events and articles for that day, and before advancing to the next day.
 - **During inference:** Once daily, after processing the day's event and article streams.
 
-Within a single day, events and articles update actor memories individually (Layers 2 and 3). Then the daily graph propagation step (Layer 4) allows those updates to ripple across the network. This two-phase structure (local updates → global propagation) repeats every day.
+Within a single day, events and articles update actor memories individually (Layers 2 and 3). Then the daily self-attention step (Layer 4) allows those updates to ripple across the population. This two-phase structure (local updates → global propagation) repeats every day.
 
-### 5.3 Graph Construction
+### 5.3 Actor Self-Attention Block
 
-```python
-def build_graph(events_recent: list[NormalizedEvent], decay_beta: float = 0.01) -> tuple[Tensor, Tensor, Tensor]:
-    """
-    Construct the multi-relational graph from recent events.
-
-    Returns:
-        edge_index: [2, E] source/target actor index pairs
-        edge_type: [E] PLOVER type index (0–17) per edge
-        edge_weight: [E] recency-weighted interaction strength per edge
-    """
-    edges = defaultdict(float)
-
-    for event in events_recent:
-        i = actor_index[event.source_actor_id]
-        j = actor_index[event.target_actor_id]
-        r = plover_index[event.event_type]
-        days_ago = (reference_date - event.event_date).days
-
-        # Exponential recency weighting
-        weight = math.exp(-decay_beta * days_ago)
-        edges[(i, j, r)] += weight
-
-    # Filter: only keep edges above minimum weight threshold
-    threshold = 0.01
-    filtered = [(i, j, r, w) for (i, j, r), w in edges.items() if w > threshold]
-
-    edge_index = torch.tensor([[i, j] for i, j, r, w in filtered]).T  # [2, E]
-    edge_type = torch.tensor([r for i, j, r, w in filtered])          # [E]
-    edge_weight = torch.tensor([w for i, j, r, w in filtered])        # [E]
-
-    return edge_index, edge_type, edge_weight
-```
-
-### 5.4 Multi-Relational Graph Attention
+Each layer is a standard transformer block: multi-head self-attention followed by a feed-forward network, with residual connections and layer normalization.
 
 ```python
-class RelationalGraphAttentionLayer(nn.Module):
+class ActorSelfAttentionLayer(nn.Module):
     """
-    One layer of multi-relational graph attention.
-    Separate weight matrices per relation type.
+    Standard transformer block over the actor population.
+    Each actor attends to all other actors.
     """
-    def __init__(self, d: int, n_relations: int = 18):
-        self.W_r = nn.ParameterList([nn.Linear(d, d) for _ in range(n_relations)])
-        self.a_r = nn.ParameterList([nn.Linear(2 * d + time_dim, 1) for _ in range(n_relations)])
-        self.layer_norm = nn.LayerNorm(d)
+    def __init__(self, d: int, n_heads: int = 8):
+        self.mha = nn.MultiheadAttention(embed_dim=d, num_heads=n_heads, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(d, 4 * d),
+            nn.GELU(),
+            nn.Linear(4 * d, d),
+        )
+        self.norm1 = nn.LayerNorm(d)
+        self.norm2 = nn.LayerNorm(d)
 
-    def forward(self, H: Tensor, edge_index: Tensor, edge_type: Tensor, edge_weight: Tensor) -> Tensor:
+    def forward(self, H: Tensor) -> Tensor:
         """
         H: [N_actors, d] current actor memories
         Returns: [N_actors, d] updated actor memories
         """
-        messages = torch.zeros_like(H)  # [N_actors, d]
+        # Self-attention: every actor attends to every other actor
+        H_norm = self.norm1(H)
+        H_attn, _ = self.mha(H_norm.unsqueeze(0), H_norm.unsqueeze(0), H_norm.unsqueeze(0))
+        H = H + H_attn.squeeze(0)  # residual
 
-        for r in range(18):
-            # Edges of this relation type
-            mask = edge_type == r
-            if not mask.any():
-                continue
+        # Feed-forward
+        H = H + self.ffn(self.norm2(H))  # residual
 
-            src = edge_index[0, mask]  # source actor indices
-            tgt = edge_index[1, mask]  # target actor indices
-            w = edge_weight[mask]      # edge weights
-
-            # Transform actor representations with relation-specific weights
-            h_src_r = self.W_r[r](H[src])  # [E_r, d]
-            h_tgt_r = self.W_r[r](H[tgt])  # [E_r, d]
-
-            # Attention coefficients
-            attn_input = torch.cat([h_src_r, h_tgt_r], dim=-1)  # [E_r, 2d]
-            alpha = F.leaky_relu(self.a_r[r](attn_input).squeeze(-1))  # [E_r]
-            alpha = alpha * w  # weight by recency
-
-            # Softmax per target node (each node normalizes over its incoming edges)
-            alpha = scatter_softmax(alpha, tgt, dim=0)
-
-            # Weighted message aggregation
-            msg = alpha.unsqueeze(-1) * h_src_r  # [E_r, d]
-            messages.scatter_add_(0, tgt.unsqueeze(-1).expand_as(msg), msg)
-
-        # Residual connection + layer norm
-        H_new = H + self.layer_norm(messages)
-        return H_new
+        return H
 ```
 
-### 5.5 Multi-Layer Stacking
+**Compute cost:** For N=1000 actors, d=256, 8 heads: the attention matrix is 1000×1000 — ~1M entries. This is trivial. The entire Layer 4 forward pass takes <1ms on a T4, compared to ~30 minutes for Layer 2 (article encoding).
 
-Stack 2–3 graph attention layers. Each layer allows information to propagate one hop further:
+### 5.4 Multi-Layer Stacking
+
+Stack 2–3 self-attention layers. Each layer allows information to propagate one additional hop through the actor population:
 
 ```python
-class TemporalGraphPropagation(nn.Module):
-    def __init__(self, d: int, n_layers: int = 2):
-        self.layers = nn.ModuleList([RelationalGraphAttentionLayer(d) for _ in range(n_layers)])
+class ActorPropagation(nn.Module):
+    def __init__(self, d: int, n_layers: int = 2, n_heads: int = 8):
+        self.layers = nn.ModuleList([
+            ActorSelfAttentionLayer(d, n_heads) for _ in range(n_layers)
+        ])
 
-    def forward(self, H: Tensor, edge_index: Tensor, edge_type: Tensor, edge_weight: Tensor) -> Tensor:
+    def forward(self, H: Tensor) -> Tensor:
         for layer in self.layers:
-            H = layer(H, edge_index, edge_type, edge_weight)
+            H = layer(H)
         return H
 ```
 
 **Learnable parameters:**
-- Per layer: 18 × (d × d) relation projections + 18 × ((2d + time_dim) × 1) attention vectors + layer norm
-- Total for 2 layers: ~2 × (18 × d² + 18 × 2d) ≈ 2 × 18 × d² ≈ 2.4M params at d=256
+- Per layer: MHA projections (4 × d × d) + FFN (d × 4d + 4d × d = 8d²) + 2 × LayerNorm (4d)
+- Total per layer: ~12d² ≈ 0.8M at d=256
+- Total for 2 layers: ~1.6M params at d=256
 
 ---
 
@@ -730,7 +693,7 @@ Each of the 18 PLOVER event types has a learnable dense embedding vector:
 relation_embeddings = nn.Embedding(18, d)  # [18, d]
 ```
 
-These are shared across the event encoding (Layer 3), dyadic representation (Layer 5), and graph construction (Layer 4). Training discovers their geometry: event types that co-occur between similar dyads, or that tend to follow each other temporally, will cluster in the embedding space.
+These are shared across the event encoding (Layer 3) and the dyadic representation (Layer 5). Layer 4 (actor self-attention) does not use relation embeddings — it learns inter-actor structure directly from the memory vectors. Training discovers their geometry: event types that co-occur between similar dyads, or that tend to follow each other temporally, will cluster in the embedding space.
 
 ### 9.2 Initialization
 
@@ -755,7 +718,7 @@ relation_embeddings.weight.data[:, 1:] = torch.randn(18, d - 1) * 0.01
 | Memory update MLP | ~0.8M | 2-layer, d × 4d × d |
 | Scalar + dimensional gates | ~0.2M | |
 | GRU source + target | ~1.6M | Two GRU cells, each d × d input |
-| Graph attention (2 layers) | ~2.4M | 18 relations × d² per layer |
+| Actor self-attention (2 layers) | ~1.6M | 2 × (MHA + FFN + LayerNorm) |
 | Survival head (shared trunk) | ~2.1M | 6d → 4d → 2d |
 | Per-event-type hazard heads (18) | ~156K | 18 × (2d → 17 bins) |
 | Hawkes excitation | ~7K | 18×18 cross-excitation + 18 decay rates |
@@ -809,7 +772,7 @@ All transformation weights are shared across actors. When the model applies `W_Q
 | Name encoding projection | W_name (768 × d), b_name, W_gate (2d × d) | Yes |
 | Memory update gate/MLP | W_proj, W_scalar, W_dims, MLP_update | Yes |
 | GRU cells | GRU_source, GRU_target (all internal weights) | Yes |
-| Graph attention layers | W_r (18 per layer), a_r (18 per layer), LayerNorm | Yes |
+| Actor self-attention layers | MHA projections, FFN weights, LayerNorm (2 layers) | Yes |
 | Survival head | Shared trunk MLP, 18 per-type hazard heads | Yes |
 | Hawkes excitation | alpha (18×18), beta (18) | Yes |
 | Intensity head | Base rate MLP | Yes |
@@ -829,7 +792,7 @@ Epoch k:
      a. For each day t in [train_start, train_end]:
         - Process all articles for day t (Layer 2: actor reads document → gated update)
         - Process all structured events for day t (Layer 3: GRU update)
-        - Run graph propagation (Layer 4: one pass over current graph)
+        - Run actor self-attention (Layer 4: all actors attend to all others)
         - Every K steps: compute loss, backprop (TBPTT), update shared params + h_baseline_i
   4. Evaluate on validation set
   5. Checkpoint shared parameters + h_baseline_i values
