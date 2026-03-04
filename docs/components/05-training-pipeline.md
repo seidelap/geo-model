@@ -190,7 +190,7 @@ Train the text encoder (ConfliBERT) and memory update mechanism (Layer 2 of the 
 
 ### 4.2 Training Objectives
 
-Three self-supervised objectives, weighted and summed:
+Five self-supervised objectives, weighted and summed:
 
 **Objective A — Masked entity prediction:**
 
@@ -262,13 +262,132 @@ def contrastive_doc_loss(anchor: str, positive: str, negatives: list[str], tempe
     return F.cross_entropy(logits, labels)
 ```
 
+**Objective D — Contrastive Predictive Coding (CPC):**
+
+Given an actor's current memory state, distinguish the actor's actual next-day article aggregate from negatives. This forces the memory to be *generatively predictive* of the information stream, not merely a summary of past inputs.
+
+```python
+def cpc_loss(
+    H: dict[str, Tensor],
+    tomorrow_aggregates: dict[str, Tensor],
+    day: date,
+    temperature: float = 0.07,
+    n_negatives: int = 15,
+) -> Tensor:
+    """
+    Contrastive Predictive Coding: actor memory predicts next-day article signal.
+
+    Run after Layer 4 (actor self-attention) each day, using tomorrow's
+    aggregate article embedding as the positive target.
+
+    H: current actor memory states (post self-attention)
+    tomorrow_aggregates: {actor_id: mean-pooled ConfliBERT embedding of tomorrow's articles}
+    """
+    loss = torch.tensor(0.0)
+    count = 0
+
+    for actor_id, h_i in H.items():
+        if actor_id not in tomorrow_aggregates:
+            continue  # no news tomorrow for this actor — skip
+
+        # Project memory into prediction space
+        z_pred = F.normalize(W_cpc_pred(h_i), dim=-1)  # [d_cpc]
+
+        # Positive: tomorrow's actual aggregate embedding for this actor
+        positive = F.normalize(W_cpc_target(tomorrow_aggregates[actor_id]), dim=-1)
+
+        # Negatives (three types, ~5 each):
+        # 1. Different actor, same day: forces encoding of *who* specifically
+        other_actors = [a for a in tomorrow_aggregates if a != actor_id]
+        neg_diff_actor = random.sample(other_actors, min(5, len(other_actors)))
+
+        # 2. Same actor, different time period: forces encoding of *when* in trajectory
+        neg_diff_time = sample_from_other_dates(actor_id, day, n=5)
+
+        # 3. Random: easy negatives for training stability
+        neg_random = sample_random_aggregates(n=5)
+
+        all_negatives = [tomorrow_aggregates[a] for a in neg_diff_actor] + neg_diff_time + neg_random
+        neg_embeddings = torch.stack([F.normalize(W_cpc_target(n), dim=-1) for n in all_negatives])
+
+        # InfoNCE loss
+        pos_score = (z_pred * positive).sum() / temperature
+        neg_scores = (z_pred @ neg_embeddings.T) / temperature
+        logits = torch.cat([pos_score.unsqueeze(0), neg_scores])
+        loss += F.cross_entropy(logits, torch.tensor(0))
+        count += 1
+
+    return loss / max(count, 1)
+```
+
+**Why CPC and not point prediction:** There are many possible "next articles" for a given actor — an article about trade, about military exercises, about diplomatic meetings, or no article at all. Predicting a single point in embedding space would just converge to the uninformative mean. CPC sidesteps this: it only asks the memory to *distinguish* relevant future articles from irrelevant ones, which is well-defined even when the future is stochastic.
+
+**Three negative types, in order of importance:**
+1. **Different actor, same day** — prevents the model from encoding only "what's happening globally" rather than actor-specific state
+2. **Same actor, different time period** — prevents the model from encoding only actor identity rather than temporal trajectory
+3. **Random** — easy negatives for numerical stability during early training
+
+**Surprise signal at inference time:** The CPC score (cosine similarity between predicted and actual embedding) provides a natural anomaly detection signal. Low score = the model was surprised by what it read. This is available as a feature for downstream prediction heads without any additional training.
+
+**Objective E — Categorical event-type prediction:**
+
+From memory state, predict the distribution of CAMEO/PLOVER event types the actor will be involved in during the next time window. This provides an interpretable "surprise" signal and a direct bridge between the self-supervised memory and the supervised prediction task.
+
+```python
+def event_type_prediction_loss(
+    H: dict[str, Tensor],
+    next_window_events: dict[str, Tensor],
+    n_event_types: int = 18,
+) -> Tensor:
+    """
+    Predict distribution over event types in the next 7-day window.
+
+    H: current actor memory states
+    next_window_events: {actor_id: [n_event_types] count vector of events in next 7 days}
+    """
+    loss = torch.tensor(0.0)
+    count = 0
+
+    for actor_id, h_i in H.items():
+        if actor_id not in next_window_events:
+            continue
+
+        # Predict event-type distribution from memory
+        logits = event_type_predictor(h_i)  # [n_event_types]
+        p_predicted = F.softmax(logits, dim=-1)
+
+        # Actual distribution (normalized counts from structured event stream)
+        counts = next_window_events[actor_id]  # [n_event_types]
+        if counts.sum() == 0:
+            continue  # no events in window
+        p_actual = counts / counts.sum()
+
+        # KL divergence: how surprised would the model be?
+        loss += F.kl_div(p_predicted.log(), p_actual, reduction="batchmean")
+        count += 1
+
+    return loss / max(count, 1)
+```
+
+**Why this complements CPC:** CPC operates in embedding space (high-dimensional, hard to interpret). Event-type prediction operates in a discrete, interpretable space. Together they provide both a rich training signal (CPC) and an interpretable diagnostic (event-type prediction). At inference time, you can literally say "the model expected CONSULT events but saw THREATEN — surprise score 3.2."
+
+**Weak supervision source:** Event-type labels come from the GDELT/POLECAT structured event stream (Component 1), not from human annotation. This makes it free to compute at scale.
+
 ### 4.3 Combined Phase 2 Loss
 
 ```python
-L_phase2 = L_masked_entity + 0.5 * L_temporal_ordering + 0.3 * L_contrastive_doc
+L_phase2 = (
+    1.0 * L_masked_entity
+    + 0.5 * L_temporal_ordering
+    + 0.3 * L_contrastive_doc
+    + 0.5 * L_cpc
+    + 0.3 * L_event_type_pred
+)
 ```
 
 Weights are tuned on a held-out set of downstream event prediction performance (using the Phase 0 LightGBM with ConfliBERT embeddings as additional features).
+
+**Design rationale for weights:** Masked entity prediction (1.0) is the primary objective — it most directly forces geopolitically meaningful memory representations. CPC (0.5) is weighted equally with temporal ordering because both test temporal dynamics of the memory. Event-type prediction (0.3) and contrastive docs (0.3) are auxiliary signals that complement the primary objectives.
 
 ### 4.4 Data Sampling
 
@@ -277,6 +396,10 @@ Weights are tuned on a held-out set of downstream event prediction performance (
 - For masked entity prediction: sample articles that mention ≥2 actors (so there's meaningful context from the non-masked actors).
 - For temporal ordering: sample pairs from the same actor dyad, separated by 7–365 days.
 - For contrastive pairs: match articles via POLECAT event codes.
+- For CPC: compute per-actor daily aggregate embeddings (mean-pooled ConfliBERT over all articles mentioning actor i on day t). CPC loss is computed after each day's Layer 4 pass, using tomorrow's aggregates as positives. Negatives are sampled from the same batch.
+- For event-type prediction: aggregate PLOVER event counts per actor over a 7-day forward window. Labels come from the structured event stream (Component 1), not from human annotation.
+
+**Temporal leakage constraint:** Phase 2 pretraining must use only articles from the **training time period**. Articles from the validation or test periods must not appear in Phase 2, even though Phase 2 is self-supervised. The encoder fine-tuned on future articles could learn distributional patterns specific to the test period, creating subtle leakage. Enforce this by filtering the article corpus to `[train_start, train_end]` before Phase 2 begins.
 
 ### 4.5 Training Schedule
 
@@ -288,6 +411,8 @@ Weights are tuned on a held-out set of downstream event prediction performance (
 ### 4.6 Success Criteria
 
 - Masked entity prediction accuracy ≥ 50% (random baseline: 1/N_actors ≈ 0.2%).
+- **CPC accuracy ≥ 70%** on held-out days (can the memory distinguish next-day articles from negatives? Random baseline: 1/(1+n_negatives) ≈ 6%).
+- **Event-type prediction KL divergence** decreasing over training, indicating the memory learns to anticipate what kinds of events actors will be involved in.
 - t-SNE of memory vectors at phase end shows meaningful geopolitical clustering: NATO allies together, BRICS together, conflict dyads separated from cooperative dyads.
 - ConfliBERT embeddings (mean-pooled article representations) added as features to the Phase 0 LightGBM improve BSS on ≥10 of 18 event types.
 
@@ -305,7 +430,27 @@ Weights are tuned on a held-out set of downstream event prediction performance (
 
 Fine-tune the entire model end-to-end on the event prediction task. This is where the model learns to predict events from actor states.
 
-### 5.2 What Gets Trained
+### 5.2 Phase 2 Auxiliary Loss Carryover
+
+Phase 2's CPC and event-type prediction objectives carry over into Phase 3 as auxiliary losses. This serves two purposes:
+1. **Regularization:** Prevents the memory from overfitting to just the 18 target event types — the CPC loss keeps the memory generally predictive of the information stream.
+2. **Catastrophic forgetting prevention:** Without these auxiliary signals, fine-tuning on supervised losses can degrade the general-purpose representations learned in Phase 2.
+
+```python
+# Phase 3 total loss (per TBPTT window):
+L_phase3 = (
+    L_supervised                            # DeepHit + Hawkes + Goldstein (see Section 7)
+    + 0.1 * L_cpc                           # carried from Phase 2, downweighted 5x
+    + 0.1 * L_event_type_pred               # carried from Phase 2, downweighted 3x
+    + L_mem + L_gate                        # regularization (unchanged)
+)
+```
+
+The 0.1 weight ensures these losses influence training without dominating the supervised signal. The CPC and event-type prediction heads continue to be trained in Phase 3 — their parameters are included in the memory update parameter group (lr=5e-4).
+
+**Surprise features for prediction heads:** The CPC score and event-type prediction error from the most recent timestep are concatenated to the dyadic representation (Section 6.1 in Component 4) as additional features for the survival head. This gives the prediction heads access to "how surprised was the model by recent inputs for this actor" — a signal that is naturally correlated with escalation and de-escalation dynamics.
+
+### 5.3 What Gets Trained
 
 All parameters are trainable, with different learning rates:
 
@@ -313,6 +458,7 @@ All parameters are trainable, with different learning rates:
 |-----------|--------------|-----------|
 | ConfliBERT encoder | 1e-5 | Small LR: preserve pretraining; just fine-tune |
 | Memory update parameters | 5e-4 | Medium: needs to adapt to supervised signal |
+| CPC + event-type prediction heads | 5e-4 | Medium: continuing Phase 2 objectives as auxiliary |
 | Actor self-attention layers | 5e-4 | Medium: new component, learning from scratch |
 | Survival/hazard heads | 1e-3 | Larger: top-level heads, most supervised gradient |
 | Hawkes excitation parameters | 1e-3 | Larger: learning temporal dynamics |
@@ -382,9 +528,18 @@ def phase3_epoch(model: FullModel, data: ChronologicalStream, K: int = 75):
         updated_H = model.actor_propagation(active_H)
         write_back_active(model.H, updated_H, active_actors)
 
-        # --- 5. TBPTT: compute losses and backprop at boundaries ---
+        # --- 5. CPC + event-type prediction (auxiliary, carried from Phase 2) ---
+        # Computed daily after self-attention, using tomorrow's data as targets
+        if day.has_next_day:
+            L_cpc = cpc_loss(model.H, day.next_day.article_aggregates, day.date)
+            L_event_pred = event_type_prediction_loss(model.H, day.next_day.event_counts)
+        else:
+            L_cpc = L_event_pred = torch.tensor(0.0)
+
+        # --- 6. TBPTT: compute losses and backprop at boundaries ---
         if memory_step_count >= K:
-            losses = compute_prediction_losses(day, model, active_actors)
+            L_supervised = compute_prediction_losses(day, model, active_actors)
+            losses = L_supervised + 0.1 * L_cpc + 0.1 * L_event_pred
             losses.backward()
             optimizer.step()
             optimizer.zero_grad()

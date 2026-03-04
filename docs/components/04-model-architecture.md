@@ -421,7 +421,10 @@ class ActorPropagation(nn.Module):
 The model's primary output is a survival curve over time, not a single probability. The dyadic representation therefore does **not** include a horizon embedding — the full temporal distribution is produced from one forward pass.
 
 ```python
-def build_dyadic_representation(h_i: Tensor, h_j: Tensor, r: int) -> Tensor:
+def build_dyadic_representation(
+    h_i: Tensor, h_j: Tensor, r: int,
+    surprise_i: Tensor, surprise_j: Tensor,
+) -> Tensor:
     """
     Construct the feature vector for a dyad-event query.
     No horizon parameter — the model outputs a full survival curve.
@@ -429,6 +432,8 @@ def build_dyadic_representation(h_i: Tensor, h_j: Tensor, r: int) -> Tensor:
     h_i: [d] source actor memory
     h_j: [d] target actor memory
     r: event type index (0–17)
+    surprise_i: [2] source actor surprise features (CPC score, event-type KL)
+    surprise_j: [2] target actor surprise features
     """
     d_ij = torch.cat([
         h_i,                            # [d]    source state
@@ -437,8 +442,10 @@ def build_dyadic_representation(h_i: Tensor, h_j: Tensor, r: int) -> Tensor:
         h_i - h_j,                      # [d]    difference (asymmetry)
         torch.abs(h_i - h_j),           # [d]    absolute difference (distance)
         relation_embeddings[r],         # [d]    relation type embedding
+        surprise_i,                     # [2]    source surprise (CPC score, event-type KL)
+        surprise_j,                     # [2]    target surprise (CPC score, event-type KL)
     ])
-    return d_ij  # [6d]
+    return d_ij  # [6d + 4]
 ```
 
 **Why these five combinations of h_i and h_j:**
@@ -446,6 +453,12 @@ def build_dyadic_representation(h_i: Tensor, h_j: Tensor, r: int) -> Tensor:
 - `h_i * h_j`: symmetric pairwise compatibility per dimension — high product means both actors are strong on that dimension
 - `h_i - h_j`: directional asymmetry — who is more powerful, more Western-aligned, more democratic
 - `|h_i - h_j|`: undirected distance per dimension — how different are they, regardless of direction
+
+**Surprise features (from CPC + event-type prediction heads):**
+- `surprise_i, surprise_j`: each is a 2-element vector containing [CPC_score, event_type_KL] for that actor at the current timestep. CPC_score = 1 − cosine_sim(predicted, actual) from the CPC head; event_type_KL = KL divergence between predicted and actual event-type distribution from the event-type prediction head.
+- These features encode "how surprised was the model by recent inputs for this actor" — a signal that correlates with escalation and de-escalation dynamics. An actor whose news stream suddenly diverges from expectations (high surprise) may be entering a transition period.
+- In Phase 2, these heads are trained by the self-supervised objectives. In Phase 3, they continue training as auxiliary losses (0.1 weight) while their outputs feed into the prediction heads as features.
+- During the first few days of a rollout (before enough history for meaningful CPC scores), surprise features are set to zero.
 
 ### 6.2 Survival Curve Output (Primary)
 
@@ -466,6 +479,7 @@ class SurvivalHead(nn.Module):
 
     def __init__(self, input_dim: int, d: int, n_event_types: int = 18):
         # Shared trunk: dyadic representation → compressed features
+        # input_dim = 6d + 4 (5 actor-state combinations + relation embedding + surprise features)
         self.shared = nn.Sequential(
             nn.Linear(input_dim, 4 * d),
             nn.ReLU(),
@@ -627,6 +641,79 @@ class IntensityHead(nn.Module):
         return lambda_t  # [T], intensity at each query time
 ```
 
+### 6.5 CPC Prediction Head (Self-Supervised / Auxiliary)
+
+Projects actor memory into a "prediction space" for contrastive predictive coding. Used as a self-supervised objective in Phase 2 and carried over as an auxiliary loss in Phase 3.
+
+```python
+class CPCPredictionHead(nn.Module):
+    """
+    Contrastive Predictive Coding: project actor memory into a space where
+    it can distinguish the actor's actual next-day article signal from negatives.
+    """
+    def __init__(self, d: int, d_cpc: int = 128):
+        # Predictor: maps memory → prediction space
+        self.W_pred = nn.Sequential(
+            nn.Linear(d, d),
+            nn.ReLU(),
+            nn.Linear(d, d_cpc),
+        )
+        # Target encoder: maps article aggregate embedding → same prediction space
+        self.W_target = nn.Sequential(
+            nn.Linear(768, d),
+            nn.ReLU(),
+            nn.Linear(d, d_cpc),
+        )
+
+    def forward(self, h_i: Tensor, target_embedding: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        h_i: [d] actor memory state (post Layer 4 self-attention)
+        target_embedding: [768] mean-pooled ConfliBERT embedding of next-day articles
+
+        Returns: (z_pred, z_target), both [d_cpc], L2-normalized
+        """
+        z_pred = F.normalize(self.W_pred(h_i), dim=-1)
+        z_target = F.normalize(self.W_target(target_embedding), dim=-1)
+        return z_pred, z_target
+```
+
+**Surprise score at inference:** `1 - cosine_sim(z_pred, z_target)` provides a per-actor, per-day anomaly score. High values mean the actor's actual news diverged from what the memory predicted. This score is concatenated to the dyadic representation (Section 6.1) as an additional feature for the survival head during Phase 3.
+
+### 6.6 Event-Type Prediction Head (Self-Supervised / Auxiliary)
+
+Predicts the distribution of PLOVER event types an actor will be involved in during the next 7-day window. Provides an interpretable "surprise" signal.
+
+```python
+class EventTypePredictionHead(nn.Module):
+    """
+    Predict next-window event-type distribution from actor memory.
+    """
+    def __init__(self, d: int, n_event_types: int = 18):
+        self.predictor = nn.Sequential(
+            nn.Linear(d, d),
+            nn.ReLU(),
+            nn.Linear(d, n_event_types),
+        )
+
+    def forward(self, h_i: Tensor) -> Tensor:
+        """
+        h_i: [d] actor memory state
+        Returns: [n_event_types] logits (apply softmax for distribution)
+        """
+        return self.predictor(h_i)
+
+    def surprise_score(self, h_i: Tensor, actual_counts: Tensor) -> float:
+        """
+        KL divergence between predicted and actual event-type distribution.
+        Interpretable: "expected CONSULT but saw THREATEN" = high surprise.
+        """
+        p_pred = F.softmax(self.predictor(h_i), dim=-1)
+        p_actual = actual_counts / actual_counts.sum().clamp(min=1)
+        return F.kl_div(p_pred.log(), p_actual, reduction="sum").item()
+```
+
+**Interpretability:** Unlike the CPC score (which operates in opaque embedding space), the event-type prediction gives human-readable diagnostics. You can inspect *which* event types the model expected vs. what occurred.
+
 ---
 
 ## 7. Gating Mechanism Details
@@ -752,6 +839,8 @@ relation_embeddings.weight.data[:, 1:] = torch.randn(18, d - 1) * 0.01
 | Per-event-type hazard heads (18) | ~156K | 18 × (2d → 17 bins) |
 | Hawkes excitation | ~7K | 18×18 cross-excitation + 18 decay rates |
 | Intensity head (high-freq types) | ~0.2M | Base rate MLP for rate-based types |
+| CPC prediction head | ~0.5M | W_pred (d→d→d_cpc) + W_target (768→d→d_cpc) |
+| Event-type prediction head | ~0.1M | MLP (d→d→18) |
 | Relation embeddings | ~5K | 18 × d |
 | Baseline projections (W_struct, W_text) | ~0.2M | Shared projections for computing h_baseline_init_i |
 | `alpha_baseline` | 1 | EMA baseline decay rate (shared scalar) |
