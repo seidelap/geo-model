@@ -14,7 +14,7 @@
 1. [Layer 1: Actor Memory Store](#6-layer-1-actor-memory-store)
 1. [Layer 2: Text Processing Stream](#7-layer-2-text-processing-stream)
 1. [Layer 3: Structured Event Stream](#8-layer-3-structured-event-stream)
-1. [Layer 4: Temporal Graph Propagation](#9-layer-4-temporal-graph-propagation)
+1. [Layer 4: Actor Self-Attention](#9-layer-4-actor-self-attention)
 1. [Layer 5: Event Prediction Head](#10-layer-5-event-prediction-head)
 1. [Layer 6: Calibration](#11-layer-6-calibration)
 1. [Gating Mechanisms](#12-gating-mechanisms)
@@ -122,13 +122,13 @@ Prediction markets aggregate distributed human knowledge effectively but have st
                     │                              │
                     ▼                              │
 ┌──────────────────────────────────────────────┐  │
-│          LAYER 4: TEMPORAL GRAPH             │◄─┘
-│          PROPAGATION (periodic)              │
+│          LAYER 4: ACTOR SELF-ATTENTION       │◄─┘
+│          (periodic, daily)                   │
 │                                              │
-│  Multi-relational graph attention across     │
-│  the international system. Propagates        │
-│  indirect information through alliance,      │
-│  trade, and interaction networks.            │
+│  Full multi-head self-attention across all   │
+│  actors. Each actor attends to every other.  │
+│  No explicit graph — topology emerges from   │
+│  learned attention patterns.                 │
 └──────────────────────┬───────────────────────┘
                        │
                        ▼
@@ -491,7 +491,7 @@ for i in active_actors:
 
 - **Residual rather than interpolation:** Rather than interpolating between old and new state (GRU-style), add a learned delta. This preserves direct gradient paths through the identity connection regardless of gate values.
 - **Separate scalar and dimensional gates:** The scalar gate handles “is this article relevant to this actor at all?” The dimensional gate handles “which aspects of this actor’s disposition does this article speak to?” These serve different purposes and use different functional forms.
-- **Exponential temporal decay:** Memory decays toward zero (or a learned baseline) between updates, reflecting that old information becomes less reliable. The decay constant λ corresponds to a half-life of roughly 3–6 months for geopolitical dispositions.
+- **Exponential temporal decay with EMA baseline:** Memory decays toward a per-actor baseline between updates, reflecting that old information becomes less reliable. The decay constant λ corresponds to a half-life of roughly 3–6 months for geopolitical dispositions. Critically, the baseline itself is not static — it evolves as a slow-moving exponential moving average (EMA) of the actor's memory, controlled by a shared learned rate `alpha_baseline ∈ (0.95, 1.0)`. This two-timescale design means one-off shocks decay away (the baseline barely moves), but sustained structural shifts gradually pull the baseline to a new resting state. The EMA is strictly causal — `b_i(t)` depends only on memory states up to time t — so no temporal leakage is possible. See Component 4, Section 2.2 for implementation details.
 
 -----
 
@@ -531,54 +531,31 @@ Both streams write to the same memory vectors. The gating mechanism handles fusi
 
 -----
 
-## 9. Layer 4: Temporal Graph Propagation
+## 9. Layer 4: Actor Self-Attention
 
-Periodically (daily or weekly), propagate information across the full international system graph. This captures second-order effects that direct observation misses: if Germany and France have a major summit, the France-Algeria relationship is also affected through second-order linkages.
+Once per simulated day, propagate information across the full actor population via standard multi-head self-attention. This captures second-order effects that direct observation misses: if Germany and France have a major summit, the France-Algeria relationship is also affected even if no direct event was coded between them.
 
-### 9.1 Graph Construction
+### 9.1 Design: Full Attention Over All Actors
 
-```
-Nodes: all active actors with current memory vectors {h_i}
-Edge types: one per PLOVER event category (18 types)
-Edge weights: function of recency × frequency of interaction
-              w_ij(r) = Σ_{t_k ∈ recent} exp(-β(t - t_k)) for events of type r
-```
-
-### 9.2 Multi-Relational Graph Attention
+Every actor attends to every other actor — no explicit graph construction, no edge types, no sparsity mask. The actor memory matrix H ∈ R^{N×d} is treated as a sequence and passed through a standard transformer block.
 
 ```python
-# For each actor i:
-for r in range(18):  # one per PLOVER event type
-    # Neighbors under relation r
-    N_r_i = [j for j in actors if w_ij(r) > threshold]
-
-    # Attention coefficients with temporal decay
-    for j in N_r_i:
-        attn_input = concat(W_r @ h_i, W_r @ h_j, time2vec(t - t_last_ij))
-        alpha_ijr = LeakyReLU(a_r.T @ attn_input)
-
-    alpha_i = softmax([alpha_ijr for j in N_r_i])
-
-    # Aggregated neighborhood message under relation r
-    msg_r = sum(alpha_ijr * W_r @ h_j for j in N_r_i)
-
-# Update: residual connection + sum across all relation types
-h_i_new = h_i + LayerNorm(sum(msg_r for r in range(18)))
+# Each layer: standard transformer block
+H_norm = LayerNorm(H)
+H = H + MultiHeadAttention(H_norm, H_norm, H_norm)   # self-attention + residual
+H = H + FFN(LayerNorm(H))                             # feed-forward + residual
 ```
 
-The attention weights `alpha_ijr` decay with time since last interaction: recently active relationships receive more weight in the propagation. The relation-specific weight matrices `W_r` (one per PLOVER type) allow different relationship types to propagate different kinds of information — a military alliance propagates security-dimension information differently than a trade agreement propagates economic-dimension information.
+**Why full attention instead of sparse graph edges:**
+- **N is small.** With 500–2000 actors, full self-attention (N² attention entries) is trivial — <1ms on GPU. Article encoding (Layer 2) dominates compute by orders of magnitude.
+- **Text-informed topology.** Actors discussed together in articles develop correlated memories. Attention discovers this without needing coded events to define edges.
+- **Emergent typed interactions.** With multi-head attention, different heads specialize (cooperative vs. adversarial relationships) — the equivalent of typed edges, learned from data.
 
-### 9.3 Multi-Layer Propagation
+### 9.2 Multi-Layer Stacking
 
-Stack 2–3 layers of graph attention to allow information to propagate across multi-hop neighborhoods. With 2 layers, a country is updated based on its direct partners’ states; with 3 layers, it also receives indirect signal from its partners’ partners.
+Stack 2–3 self-attention layers. Each layer allows information to propagate one additional hop through the actor population. With 2 layers, information flows from any actor to any other actor through an intermediate.
 
-```python
-for layer in range(num_layers):
-    h_new = graph_attention_layer(h_current, edge_index, edge_types, edge_weights)
-    h_current = h_new
-```
-
-In practice 2 layers is usually sufficient for capturing the relevant international system structure without over-smoothing actor representations.
+In practice 2 layers is sufficient for capturing the relevant international system structure without over-smoothing actor representations.
 
 -----
 
@@ -1089,7 +1066,7 @@ Assuming 40,000 articles/day after pre-filtering (from ~500,000 raw):
 
 ```
 Daily encoding (40K articles, T4 spot, ~30 min):       ~$0.20/day  → ~$6/month
-Graph propagation (daily batch, T4, ~10 min):           ~$0.07/day  → ~$2/month
+Actor self-attention (daily batch, T4, <1 min):          ~$0.01/day  → ~$0.30/month
 Training runs (weekly, A10G spot, 4 hours):             ~$2.00/week → ~$8/month
 Storage (GDELT history, embeddings, ~500GB S3):         ~$12/month
 Total:                                                  ~$28/month
@@ -1112,7 +1089,7 @@ This is achievable on a hobby budget. The bottleneck is engineering and research
 ```
 Actor memories: 5,000 actors × 512 floats × 4 bytes = ~10 MB (trivial)
 ConfliBERT inference: ~2 GB VRAM (batch size 32)
-Graph attention (200 nodes, 18 relations): ~500 MB VRAM
+Actor self-attention (1000 actors, 2 layers): ~50 MB VRAM
 Total VRAM for inference: ~4-6 GB
 Training (with gradients + optimizer states): ~16-20 GB
 → Fits on RTX 3090/4090 (24 GB) or A10G (24 GB)
@@ -1139,17 +1116,17 @@ Train LightGBM classifiers per event type. Evaluate with Brier score, BSS, relia
 
 ### Phase 2: Neural Embeddings (Months 3–5, single GPU)
 
-Add ConfliBERT-based text feature extraction. Construct temporal knowledge graph: countries as nodes, dyadic CAMEO/PLOVER events as typed timestamped edges. Implement EvolveGCN using PyTorch Geometric Temporal. Multi-task prediction heads for all 18 event types. Apply focal loss + class weights. Post-hoc temperature scaling.
+Add ConfliBERT-based text feature extraction. Implement actor self-attention propagation (standard transformer blocks over the actor population). Multi-task prediction heads for all 18 event types. Apply focal loss + class weights. Post-hoc temperature scaling.
 
 **Expected outcome:** Improvement over Phase 1 baseline, especially for events with strong textual precursors.
 
-**Tools:** `transformers` (ConfliBERT), `pytorch_geometric_temporal` (EvolveGCN), `pycox` (survival analysis), `mordecai3` (geoparsing)
+**Tools:** `transformers` (ConfliBERT), `pycox` (survival analysis), `mordecai3` (geoparsing)
 
 ### Phase 3: Full Architecture (Months 6–12, single GPU)
 
-Implement TGN-style per-actor memory with gated text updates (Layer 2). Add Neural ODE continuous dynamics via `torchdyn`. Add structured event fast-update stream (Layer 3). Full multi-relational temporal graph attention propagation (Layer 4). Transformer Hawkes Process for temporal event density prediction. Ensemble across model families. Real-time GDELT/POLECAT ingestion pipeline. Benchmarking against Polymarket and ViEWS. Interactive visualization dashboard.
+Implement TGN-style per-actor memory with gated text updates (Layer 2). Add Neural ODE continuous dynamics via `torchdyn`. Add structured event fast-update stream (Layer 3). Full actor self-attention propagation (Layer 4). Transformer Hawkes Process for temporal event density prediction. Ensemble across model families. Real-time GDELT/POLECAT ingestion pipeline. Benchmarking against Polymarket and ViEWS. Interactive visualization dashboard.
 
-**Expected outcome:** Competitive with or superior to Polymarket on low-salience geopolitical events. Publishable architecture contribution (entity memory + temporal graph + Hawkes process coupling).
+**Expected outcome:** Competitive with or superior to Polymarket on low-salience geopolitical events. Publishable architecture contribution (entity memory + actor self-attention + Hawkes process coupling).
 
 -----
 
@@ -1157,8 +1134,7 @@ Implement TGN-style per-actor memory with gated text updates (Layer 2). Add Neur
 
 |Component                 |Repository                                                 |Purpose                                              |
 |--------------------------|-----------------------------------------------------------|-----------------------------------------------------|
-|PyTorch Geometric Temporal|`github.com/benedekrozemberczki/pytorch_geometric_temporal`|Dynamic GNN implementations (EvolveGCN, A3TGCN)      |
-|TGN                       |`github.com/twitter-research/tgn`                          |Temporal Graph Networks framework                    |
+|PyTorch Geometric Temporal|`github.com/benedekrozemberczki/pytorch_geometric_temporal`|Reference for dynamic GNN baselines (comparison only) |
 |RE-NET                    |`github.com/INK-USC/RE-Net`                                |Autoregressive temporal KG event prediction          |
 |TComplEx/TNTComplEx       |`github.com/facebookresearch/tkbc`                         |Static+temporal KG embedding baselines               |
 |Transformer Hawkes Process|`github.com/SimiaoZuo/Transformer-Hawkes-Process`          |Neural temporal point process                        |
@@ -1186,7 +1162,7 @@ Several aspects of this design remain genuinely open and represent opportunities
 
 **Optimal dimensionality.** NOMINATE works in 2D and captures 83% of vote variance in legislatures. What is the effective dimensionality of geopolitical actor space? Early experiments with the BPTD framework on ICEWS data suggest 20–50 latent dimensions capture most of the variance, but this has not been systematically studied for the full actor set including non-state actors and leaders.
 
-**Memory half-life by actor type.** The exponential decay constant λ is assumed uniform across actors and dimensions. In reality, a small state’s economic posture may be very stable (long half-life) while its security alignment after a coup may change overnight (short half-life). Learning adaptive half-lives per dimension per actor type is an open architectural question.
+**Memory half-life by actor type.** The exponential decay constant λ is assumed uniform across actors and dimensions. In reality, a small state’s economic posture may be very stable (long half-life) while its security alignment after a coup may change overnight (short half-life). Learning adaptive half-lives per dimension per actor type is an open architectural question. The EMA baseline mechanism (see Component 4, Section 2.2) partially addresses this: even with a shared λ, the slow-moving baseline adapts to sustained shifts, so the effective memory horizon is longer than λ alone would suggest. The current `alpha_baseline` is a shared scalar; per-type rates (e.g., states vs. non-state actors) are a natural extension if the shared rate proves too restrictive.
 
 **Cross-lingual signal.** GDELT and Common Crawl News cover 100+ languages, but the encoder stack (ConfliBERT) is primarily English-trained. Events reported only in Arabic, Chinese, or Russian language media — which often carry different perspectives on the same events — are underrepresented. Multilingual pretraining or cross-lingual alignment is needed to fully exploit these sources.
 
