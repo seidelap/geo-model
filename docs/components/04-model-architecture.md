@@ -80,8 +80,7 @@ Extract information from news articles and update actor memory vectors. This is 
 Curated article
   → Sketch-based actor relevance filter (CPU, fast)
   → Full document encoding with ConfliBERT (GPU)
-  → Actor mention extraction
-  → Cross-actor interaction representation
+  → Actor memory cross-attention over document (each relevant actor queries the document)
   → Gated memory update
 ```
 
@@ -135,93 +134,70 @@ def encode_document(article_text: str) -> Tensor:
 
 **Throughput:** ~8,000–12,000 tokens/sec on T4; ~40,000 articles/day takes ~25–35 minutes.
 
-### 3.5 Actor Mention Extraction
+### 3.5 Actor Memory Cross-Attention Over Document
 
-For each active actor, extract their representation from the document:
-
-```python
-def extract_actor_mention(T: Tensor, actor_id: str, article_text: str, actor_weight: float) -> Tensor:
-    """
-    Extract an actor-specific representation from encoded document.
-
-    Two strategies, combined:
-    1. Hard mention pooling: average embeddings at token positions where the actor is named
-    2. Soft weighted pooling: weight all tokens by actor relevance (fallback for indirect mentions)
-    """
-    mention_spans = find_mention_spans(article_text, actor_id)  # NER + alias matching
-
-    if mention_spans:
-        # Hard mention: average contextual embeddings at mention positions
-        mention_tokens = torch.cat([T[start:end] for start, end in mention_spans])
-        m_hard = mention_tokens.mean(dim=0)  # [768]
-
-        # Blend with soft attention for broader context
-        attn_weights = softmax(T @ m_hard / math.sqrt(768))  # [seq_len]
-        m_soft = (attn_weights.unsqueeze(-1) * T).sum(dim=0)  # [768]
-
-        m_i = 0.7 * m_hard + 0.3 * m_soft  # weighted blend
-    else:
-        # No explicit mention found — use soft pooling only (indirect relevance from sketch)
-        # Use a learned query vector per actor type as attention query
-        query = actor_type_queries[actor_type_of(actor_id)]  # [768]
-        attn_weights = softmax(T @ query / math.sqrt(768))
-        m_i = (attn_weights.unsqueeze(-1) * T).sum(dim=0)  # [768]
-
-    return m_i  # [768]
-```
-
-### 3.6 Cross-Actor Interaction Representation
-
-When multiple actors co-occur in an article, compute a pairwise interaction representation:
+Each relevant actor uses its current memory vector as a query to attend over the full encoded document. There is no mention extraction or NER — the actor's memory determines what it attends to.
 
 ```python
-def compute_cross_actor(m_i: Tensor, m_j: Tensor, T: Tensor) -> Tensor:
+def actor_reads_document(
+    h_i: Tensor,           # current actor memory [d]
+    T: Tensor,             # encoded document [seq_len, 768]
+) -> Tensor:
     """
-    What is happening between actors i and j in this document?
-    Cross-attention: actor i attends to document context conditioned on actor j.
+    Actor i reads the document by cross-attending over all tokens.
+
+    The actor's memory is the query. The document tokens are keys/values.
+    What the actor extracts depends on its current state — a country
+    in a security crisis attends to different tokens than one in a
+    trade negotiation, even in the same article.
     """
-    query = W_Q(m_i)          # [d_k]
-    keys = W_K(T)             # [seq_len, d_k]
-    values = W_V(T)           # [seq_len, d_v]
+    # Project actor memory to query space
+    query = W_Q(h_i)              # [d_k]
 
-    # Condition query on the other actor
-    query_conditioned = query + W_cond(m_j)  # [d_k], adds relational bias
+    # Project document tokens to key/value space (shared across all actors)
+    keys = W_K(T)                 # [seq_len, d_k]
+    values = W_V(T)               # [seq_len, d_v]
 
-    attn_scores = query_conditioned @ keys.T / math.sqrt(d_k)  # [seq_len]
-    attn_weights = softmax(attn_scores)
-    c_ij = attn_weights @ values  # [d_v]
+    # Standard scaled dot-product attention
+    attn_scores = query @ keys.T / math.sqrt(d_k)  # [seq_len]
+    attn_weights = softmax(attn_scores)             # [seq_len]
+    m_i = attn_weights @ values                     # [d_v]
 
-    return c_ij
+    return m_i  # what actor i extracted from this document
 ```
 
-This is computed for every pair of co-active actors in the article. For an article mentioning 5 actors, this produces 5×4 = 20 pairwise representations. In practice, most articles mention 2–3 actors, keeping this manageable.
+**Why this works:**
+- No NER or entity linking needed. The model learns what to attend to from the training signal.
+- The actor's current state determines its attention pattern. A country that just had a coup will attend differently than one in a stable period, even in the same article.
+- Cross-actor interaction is implicit: if Russia and Ukraine both read the same article, their memory updates are coupled through the shared document encoding and through the subsequent graph propagation step.
+- **New entities** work naturally: a newly added actor starts with its initial embedding from Component 2 (structural projection or text-derived). This generic embedding serves as the first attention query. The query will be broad at first, but the gating mechanism (Section 3.6) controls how much signal gets through, and after a few articles the memory specializes.
 
-### 3.7 Gated Memory Update
+**Compared to the alternatives:**
+- No mention spans to find → no NER errors, no pipeline fragility
+- No pairwise cross-actor attention → O(A) per article instead of O(A²), where A is the number of relevant actors
+- No per-actor-type query vectors for unmentioned actors → uniform mechanism for all actors
+
+### 3.6 Gated Memory Update
 
 Update each active actor's memory:
 
 ```python
 def update_memory_from_text(
     h_i: Tensor,           # current memory [d]
-    m_i: Tensor,           # actor mention representation [768]
-    c_ij_list: list[Tensor],  # cross-actor representations involving i
+    m_i: Tensor,           # what actor i read from the document [d_v]
     t: float,              # current timestamp
     t_last: float,         # last update timestamp
 ) -> Tensor:
     """
     Gated residual update to actor memory.
     """
-    # Aggregate relational context
-    if c_ij_list:
-        relational_context = torch.stack(c_ij_list).mean(dim=0)  # [d_v]
-    else:
-        relational_context = torch.zeros(d_v)
-
-    # Project mention and context to memory dimension
-    update_input = W_proj(torch.cat([h_i, m_i, relational_context, time2vec(t)]))  # [d]
+    # Project document reading and current state to memory dimension
+    update_input = W_proj(torch.cat([h_i, m_i, time2vec(t)]))  # [d]
 
     # Scalar gate: should this article update this actor at all?
-    gate_scalar = sparsemax(W_scalar(update_input))  # scalar in [0, 1], competing across actors
+    # Competes across actors via sparsemax — an article about NATO-Russia tensions
+    # should update Russia strongly, NATO somewhat, and Portugal barely at all
+    gate_scalar = sparsemax(W_scalar(update_input))  # scalar in [0, 1]
 
     # Dimensional gate: which dimensions to update?
     gate_dims = sigmoid(W_dims(update_input))  # [d], independent per dimension
@@ -238,12 +214,14 @@ def update_memory_from_text(
 
 **Learnable parameters in this layer:**
 - ConfliBERT encoder: 110M params (fine-tuned, not frozen)
-- W_Q, W_K, W_V, W_cond: cross-attention projections, 4 × (768 × d_k)
-- W_proj: input projection, (768 + 768 + d_v + time_dim) × d
+- W_Q: d × d_k (actor memory → query projection)
+- W_K: 768 × d_k (document tokens → key projection)
+- W_V: 768 × d_v (document tokens → value projection)
+- W_proj: input projection, (d + d_v + time_dim) × d
 - W_scalar: scalar gate, d × 1
 - W_dims: dimensional gate, d × d
 - MLP_update: 2-layer MLP, d × 4d × d
-- h_baseline per actor: N_actors × d
+- h_baseline per actor: N_actors × d (actor-specific, see Section 11)
 - time2vec parameters: time_dim
 
 ---
@@ -321,9 +299,12 @@ Propagate information across the actor network periodically. Captures second-ord
 
 ### 5.2 Execution Schedule
 
-Run graph propagation as a batch process:
-- **During training:** After every N memory update steps (N = 50–100 events/articles).
-- **During inference:** Daily or weekly, depending on compute budget.
+Run graph propagation **once per simulated day**, in both training and inference. This ensures identical cadence — the model never sees a different graph update rhythm than what it will encounter in production.
+
+- **During training:** At the end of each simulated day in the chronological rollout, after processing all events and articles for that day, and before advancing to the next day.
+- **During inference:** Once daily, after processing the day's event and article streams.
+
+Within a single day, events and articles update actor memories individually (Layers 2 and 3). Then the daily graph propagation step (Layer 4) allows those updates to ripple across the network. This two-phase structure (local updates → global propagation) repeats every day.
 
 ### 5.3 Graph Construction
 
@@ -777,3 +758,72 @@ relation_embeddings.weight.data[:, 1:] = torch.randn(18, d - 1) * 0.01
 | **Total (including encoder)** | **~120M** | |
 
 At d=256 and N_actors=500. Scales roughly as d² for most components.
+
+---
+
+## 11. Parameter Classification: Actor-Specific vs Shared
+
+Every value in the model falls into one of three categories. Getting this wrong — especially carrying actor-specific state across epochs — would leak future information into earlier time periods.
+
+### 11.1 Actor-Specific State (Reset Each Epoch)
+
+These are **state variables**, not learned parameters. They are populated during the chronological rollout and reset at the start of each training epoch.
+
+| Value | Shape | Description | In Optimizer? |
+|-------|-------|-------------|---------------|
+| `h_i(t)` | `[d]` per actor | Actor memory vector. Evolves through the rollout via Layers 2, 3, 4. | **No.** This is computed state, not a gradient-updated parameter. |
+| `t_last_updated_i` | scalar per actor | Timestamp of last memory update. Used for temporal decay. | No. |
+
+**At epoch start:** For each actor i, set `h_i(0) = h_baseline_i` and `t_last_updated_i = epoch_start_date`. The rollout then evolves memories forward through time. Gradients flow through the memory updates (within each TBPTT window), but the memory values themselves are never carried from one epoch to the next.
+
+**Why reset?** Each epoch replays the full training period chronologically. If memories from the previous epoch persisted, the actor states at time t would contain information from events after t (from the previous epoch's rollout). This is temporal leakage. Resetting ensures the model can only use information from the past within each rollout.
+
+### 11.2 Actor-Specific Learned Parameters (Persist Across Epochs)
+
+These are **learned parameters** — they have gradients and are updated by the optimizer. They persist across epochs because they represent stable properties, not temporal state.
+
+| Value | Shape | Description | In Optimizer? |
+|-------|-------|-------------|---------------|
+| `h_baseline_i` | `[d]` per actor | Learned resting state that memory decays toward. Represents the actor's "default disposition." Initialized from structural embedding (Component 2). | **Yes.** |
+| `sketch_i` | `[sketch_dim]` per actor | TF-IDF sketch vector for text relevance filtering. | **No.** Recomputed periodically (see Component 2, Section 4.2). Not learned by gradient descent. |
+
+**`h_baseline_i` details:** This is the key actor-specific learned value. It captures what the model thinks actor i looks like in the absence of recent information. The optimizer adjusts it so that `apply_decay(h_i, ...)` produces useful starting points. Because it represents a time-invariant property (the actor's structural identity), it does not leak temporal information across epochs.
+
+### 11.3 Shared Learned Parameters (Persist Across Epochs)
+
+All transformation weights are shared across actors. When the model applies `W_Q @ h_i` to compute an attention query, the same `W_Q` is used for every actor. This is critical — the model learns *how* to update memories, not *what* each actor's memory should be at a given time.
+
+| Component | Parameters | In Optimizer? |
+|-----------|-----------|---------------|
+| ConfliBERT encoder | All 110M BERT weights | Yes (lr=1e-5) |
+| Cross-attention projections | W_Q (d × d_k), W_K (768 × d_k), W_V (768 × d_v) | Yes |
+| Memory update gate/MLP | W_proj, W_scalar, W_dims, MLP_update | Yes |
+| GRU cells | GRU_source, GRU_target (all internal weights) | Yes |
+| Graph attention layers | W_r (18 per layer), a_r (18 per layer), LayerNorm | Yes |
+| Survival head | Shared trunk MLP, 18 per-type hazard heads | Yes |
+| Hawkes excitation | alpha (18×18), beta (18) | Yes |
+| Intensity head | Base rate MLP | Yes |
+| Relation embeddings | Embedding(18, d) | Yes |
+| Time2Vec | 2 instances, all frequency/phase parameters | Yes |
+| `lambda_decay` | Scalar (shared) or per-type (18 values) | Yes |
+
+**Key invariant:** No shared parameter depends on actor identity. The same GRU processes events for Russia and for Luxembourg. Actor-specific behavior emerges entirely from the actor-specific state (`h_i`, `h_baseline_i`) flowing through shared transformations.
+
+### 11.4 Epoch Structure Summary
+
+```
+Epoch k:
+  1. Reset all h_i(t) ← h_baseline_i for every actor i
+  2. Reset all t_last_updated_i ← training_start_date
+  3. Rollout chronologically through the training period:
+     a. For each day t in [train_start, train_end]:
+        - Process all articles for day t (Layer 2: actor reads document → gated update)
+        - Process all structured events for day t (Layer 3: GRU update)
+        - Run graph propagation (Layer 4: one pass over current graph)
+        - Every K steps: compute loss, backprop (TBPTT), update shared params + h_baseline_i
+  4. Evaluate on validation set
+  5. Checkpoint shared parameters + h_baseline_i values
+
+Shared parameters and h_baseline_i carry over to epoch k+1.
+h_i(t) and t_last_updated_i do NOT carry over — they are recomputed from scratch.
+```

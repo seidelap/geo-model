@@ -319,83 +319,161 @@ All parameters are trainable, with different learning rates:
 | Intensity head (high-freq types) | 1e-3 | Larger: learning rate dynamics |
 | Relation embeddings | 5e-4 | Medium: should shift to capture prediction structure |
 
-### 5.3 Training Loop
+### 5.3 Training Loop: Chronological Rollout
+
+Training processes the full training period day by day. Within each day, events and articles update actor memories. At the end of each day, graph propagation runs. Prediction losses are computed at TBPTT boundaries.
 
 ```python
-def phase3_training_step(batch: list[TrainingExample], model: FullModel) -> dict:
+def phase3_epoch(model: FullModel, data: ChronologicalStream, K: int = 75):
     """
-    One training step of Phase 3 supervised fine-tuning.
+    One epoch of Phase 3: chronological rollout over the training period.
 
-    Two example types:
-    - SurvivalTrainingExample: time-to-event targets (rare/moderate event types)
-    - IntensityTrainingExample: event rate targets (high-frequency event types)
+    The rollout simulates the passage of time. Each day:
+      1. Activate/deactivate actors whose lifecycle boundaries fall on this day
+      2. Process all articles for this day (Layer 2)
+      3. Process all structured events for this day (Layer 3)
+      4. Run graph propagation (Layer 4)
+      5. At TBPTT boundaries: compute losses, backprop, update parameters
     """
-    total_loss = 0.0
-    metrics = defaultdict(float)
+    # --- Epoch initialization (see Component 4, Section 11) ---
+    # Reset all actor memories to their learned baselines
+    for actor in registry.all_actors():
+        model.H[actor.actor_id] = model.h_baseline[actor.actor_id].clone()
+        model.t_last[actor.actor_id] = data.start_date
 
-    for example in batch:
-        # 1. Load context window and replay memory updates
-        #    Process the events/articles in the context window chronologically
-        #    to bring actor memories to their state at reference_date
-        h_i, h_j = replay_context(example.context_window_key, model)
+    # Track which actors are currently active
+    active_actors = set()
+    memory_step_count = 0
 
-        # 2. Run graph propagation (if this step is a graph-step)
-        if step_count % graph_every == 0:
-            H_all = model.graph_propagation(H_all, edge_index, edge_type, edge_weight)
-            h_i, h_j = H_all[i], H_all[j]
+    for day in data.iter_days():  # each day in [train_start, train_end]
 
-        # 3. Build dyadic representation (no horizon parameter — model outputs full curve)
-        d_ij = model.build_dyadic_representation(h_i, h_j, example.event_type)
+        # --- 1. Actor lifecycle: activate/deactivate ---
+        newly_active, newly_retired = registry.lifecycle_changes_on(day)
+        for actor in newly_active:
+            activate_actor(model, actor, day)
+            active_actors.add(actor.actor_id)
+        for actor in newly_retired:
+            deactivate_actor(model, actor, day)
+            active_actors.discard(actor.actor_id)
 
-        if isinstance(example, SurvivalTrainingExample):
-            # --- Survival target: time-to-event ---
-            # Get Hawkes excitation from recent event history for this dyad
-            event_history = get_dyad_event_history(example.source_actor_id, example.target_actor_id)
-            excitation = model.hawkes(event_history, example.event_type, example.reference_date, bin_midpoints)
+        # --- 2. Process articles for this day (Layer 2) ---
+        for article in day.articles:
+            relevant_actors = model.filter_relevant_actors(article, active_actors)
+            T = model.encode_document(article)
+            for actor_id, weight in relevant_actors:
+                m_i = model.actor_reads_document(model.H[actor_id], T)
+                model.H[actor_id] = model.update_memory_from_text(
+                    model.H[actor_id], m_i, day.date, model.t_last[actor_id]
+                )
+                model.t_last[actor_id] = day.date
+            memory_step_count += 1
 
-            # Forward pass through survival head (hazard + excitation → survival curve)
-            pred = model.survival_head(d_ij, example.event_type, excitation=excitation)
+        # --- 3. Process structured events for this day (Layer 3) ---
+        for event in day.events:
+            if event.source_actor_id in active_actors and event.target_actor_id in active_actors:
+                model.H[event.source_actor_id], model.H[event.target_actor_id] = \
+                    model.update_from_event(event)
+                model.t_last[event.source_actor_id] = day.date
+                model.t_last[event.target_actor_id] = day.date
+            memory_step_count += 1
 
-            # Primary loss: DeepHit NLL on the observed event time (or censoring time)
-            L_survival = deephit_loss(
-                pred, example.time_bin_index, example.censored, example.event_type_weight
-            )
+        # --- 4. Graph propagation (once per day, Layer 4) ---
+        active_H, active_edges = build_active_subgraph(model.H, active_actors, day.date)
+        updated_H = model.graph_propagation(active_H, *active_edges)
+        write_back_active(model.H, updated_H, active_actors)
 
-            # Auxiliary: Goldstein regression (if event occurred)
-            if example.event_occurred:
-                L_goldstein = F.mse_loss(pred["goldstein_pred"], example.event_goldstein)
-            else:
-                L_goldstein = 0.0
-
-            weight = example.temporal_weight * example.event_type_weight
-            if example.is_negative:
-                weight *= example.negative_confidence
-
-            step_loss = weight * (L_survival + 0.1 * L_goldstein)
-
-        elif isinstance(example, IntensityTrainingExample):
-            # --- Intensity target: event rate ---
-            L_hawkes = hawkes_nll(
-                model.intensity_head, h_i, h_j, example.event_type,
-                example.event_times, example.period_end - example.period_start
-            )
-            weight = example.temporal_weight * example.event_type_weight
-            step_loss = weight * L_hawkes
-
-        # Regularization (applied to all examples)
-        L_mem = 0.01 * (h_i.norm().pow(2) + h_j.norm().pow(2))
-        L_gate = model.get_gate_penalty()
-        step_loss += L_mem + 0.01 * L_gate
-
-        total_loss += step_loss
-
-    total_loss /= len(batch)
-    total_loss.backward()
-
-    return metrics
+        # --- 5. TBPTT: compute losses and backprop at boundaries ---
+        if memory_step_count >= K:
+            losses = compute_prediction_losses(day, model, active_actors)
+            losses.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            model.detach_memories()  # truncate gradient path
+            memory_step_count = 0
 ```
 
-### 5.4 Curriculum Learning
+### 5.4 Actor Lifecycle During Training
+
+Actors enter and leave the system during the chronological rollout. The model must handle this explicitly — not all 500 actors exist at all points in time.
+
+#### 5.4.1 Activating an Actor
+
+When the rollout reaches an actor's `active_from` date:
+
+```python
+def activate_actor(model: FullModel, actor: Actor, date: date):
+    """
+    Bring a new actor into the model during the training rollout.
+
+    Called when the rollout date reaches actor.active_from.
+    """
+    # Initialize memory from learned baseline
+    model.H[actor.actor_id] = model.h_baseline[actor.actor_id].clone()
+    model.t_last[actor.actor_id] = date
+
+    # The actor now participates in:
+    # - Text processing: its sketch vector is included in relevance filtering
+    # - Event processing: events involving it trigger GRU updates
+    # - Graph propagation: it receives messages from neighbors
+    # - Prediction queries: dyads involving it are now queryable
+```
+
+**Where `h_baseline` comes from for new actors:** The baseline is initialized from Component 2 (structural projection for states, text-derived for leaders/orgs, neighbor average as fallback). During training, the optimizer updates `h_baseline` via gradients — but only from time steps *after* the actor is active.
+
+#### 5.4.2 Deactivating an Actor
+
+When the rollout reaches an actor's `active_to` date:
+
+```python
+def deactivate_actor(model: FullModel, actor: Actor, date: date):
+    """
+    Remove an actor from active participation during the training rollout.
+
+    The actor's memory is frozen but retained — it is needed for
+    historical graph edges and for any training examples that reference
+    this actor's state at earlier time points.
+    """
+    # Freeze: stop updating this actor's memory
+    model.H[actor.actor_id] = model.H[actor.actor_id].detach()
+
+    # The actor no longer participates in:
+    # - New text/event processing (no more memory updates)
+    # - Graph propagation (excluded from active subgraph)
+    # - New prediction queries (dyads involving it are not sampled)
+    #
+    # But its frozen state is still available:
+    # - As a graph neighbor for historical edge construction
+    # - As source/target state for loss computation on examples
+    #   with reference dates before the deactivation
+```
+
+#### 5.4.3 Leader Succession Example
+
+The most common lifecycle event is a leadership change:
+
+```
+Day 1021 (2023-01-20): leader:USA_POTUS_45 reaches active_to
+  → deactivate_actor(model, "leader:USA_POTUS_45", day)
+  → Freeze memory at current state
+
+Day 1021 (2023-01-20): leader:USA_POTUS_46 reaches active_from
+  → activate_actor(model, "leader:USA_POTUS_46", day)
+  → Initialize from h_baseline (text-derived from speeches, biography)
+
+Note: state:USA is unaffected — it remains active throughout.
+The state's memory continues evolving; the new leader's actions
+will gradually shift the state embedding through events/articles.
+```
+
+#### 5.4.4 Gradient Flow for Actor-Specific Baselines
+
+When computing losses for training examples that involve actor i:
+- Gradients flow through `h_i(t)` back through the memory update chain (within the TBPTT window)
+- At the start of the TBPTT window, `h_i` was either: (a) the output of a previous TBPTT window (detached), or (b) `h_baseline_i` (at epoch start or actor activation)
+- In case (b), the gradient reaches `h_baseline_i` and updates it. This is how the optimizer learns each actor's resting state.
+- Actors that appear in more training examples receive more gradient signal for their baselines. This is correct — we have more information about those actors.
+
+### 5.5 Curriculum Learning
 
 Don't present all event types at full weight from the start. Gradually increase the weight on rare events:
 
@@ -419,7 +497,7 @@ def curriculum_weight(event_type: str, step: int, total_steps: int, warmup_frac:
 2. Steps 20–80%: full training at target weights
 3. Steps 80–100%: reduce learning rate by 10x (cosine decay), continue training
 
-### 5.5 Truncated Backpropagation Through Time (TBPTT)
+### 5.6 Truncated Backpropagation Through Time (TBPTT)
 
 The model processes events and articles chronologically, updating actor memories at each step. Full backpropagation through the entire history is infeasible. Instead, truncate gradients:
 
@@ -449,7 +527,7 @@ def train_with_tbptt(data_stream: Iterator, model: FullModel, K: int = 75):
             model.detach_memories()
 ```
 
-### 5.6 Auxiliary Losses at Intermediate Timesteps
+### 5.7 Auxiliary Losses at Intermediate Timesteps
 
 To create shorter gradient paths and prevent vanishing gradients, add prediction losses not just at the final step but also at intermediate checkpoints:
 
@@ -463,7 +541,7 @@ if step % M == 0:
     total_loss += intermediate_loss
 ```
 
-### 5.7 Training Schedule
+### 5.8 Training Schedule
 
 - **Optimizer:** AdamW with separate parameter groups (different LRs per component, see Section 5.2).
 - **Batch size:** Process events/articles in chronological order. Each TBPTT window of K=75 steps constitutes one "batch."
@@ -472,7 +550,7 @@ if step % M == 0:
 - **Gradient clipping:** Max norm 1.0 to prevent exploding gradients from long temporal chains.
 - **Early stopping:** Monitor validation concordance index (C-index) and Brier scores derived from the CDF. Stop if no improvement for 10 evaluation epochs.
 
-### 5.8 Evaluation During Training
+### 5.9 Evaluation During Training
 
 Every 5,000 steps, run evaluation on the validation set (Component 3, Section 6):
 - Derive fixed-horizon Brier scores from the survival CDF at standard horizons (7, 30, 90, 180 days).
@@ -481,7 +559,7 @@ Every 5,000 steps, run evaluation on the validation set (Component 3, Section 6)
 - Log reliability diagrams for visual inspection at each standard horizon.
 - If BSS is worse than Phase 0 baseline for >50% of event types at the 30-day horizon, something is wrong — investigate before continuing.
 
-### 5.9 Success Criteria
+### 5.10 Success Criteria
 
 - **BSS > Phase 0 BSS at 30-day horizon for ≥14 of 18 event types** (the neural model should improve on the tree baseline for most types).
 - **Aggregate Brier score improvement ≥ 5% over Phase 0 at 30-day horizon** (weighted by event type importance).
@@ -489,7 +567,7 @@ Every 5,000 steps, run evaluation on the validation set (Component 3, Section 6)
 - **Calibration:** ECE < 0.10 at all standard horizons before post-hoc calibration (Layer 6 will improve this further).
 - **No regression:** The model should not be worse than Phase 0 on any event type by more than 10% relative BSS at the 30-day horizon. If it is, that type needs debugging.
 
-### 5.10 Compute
+### 5.11 Compute
 
 - Full Phase 3 training: ~50–100 GPU-hours on A10G.
 - At spot pricing: ~$50–100.
@@ -497,9 +575,43 @@ Every 5,000 steps, run evaluation on the validation set (Component 3, Section 6)
 
 ---
 
-## 6. Loss Functions (Detailed)
+## 6. Epoch Structure and Memory Reset
 
-### 6.1 DeepHit Survival Loss (Primary — Survival-Target Types)
+### 6.1 What Happens Between Epochs
+
+Each epoch replays the entire training period from `train_start` to `train_end`. Between epochs:
+
+**Reset (actor-specific state):**
+- All `h_i(t)` → `h_baseline_i` (learned baseline)
+- All `t_last_updated_i` → `train_start_date`
+- Active actor set → recomputed from scratch based on `active_from` dates
+
+**Persist (learned parameters):**
+- `h_baseline_i` for every actor (updated by optimizer during the epoch)
+- All shared weights (encoder, projections, gates, GRUs, heads, etc.)
+- Optimizer state (momentum, adaptive learning rates)
+
+### 6.2 Why Memory Reset Is Necessary
+
+The model's value comes from learning shared transformations (how to update memories, how to propagate information, how to predict events), not from memorizing actor states at particular times. If actor memories carried over between epochs:
+
+1. **Temporal leakage:** At the start of epoch k+1, `h_Russia(t=0)` would contain information from events at `t=2000 days` (end of epoch k). The model would start with future knowledge baked into its states.
+2. **Gradient confusion:** The optimizer would receive conflicting signals — gradients from early in the rollout would push memories one way, but the carried-over state already reflects the end of the previous epoch.
+3. **Baseline learning failure:** The optimizer would have no incentive to learn good `h_baseline_i` values, since memories would never actually start from baseline.
+
+By resetting, each epoch provides a clean forward pass. The only information that persists is encoded in the shared weights and baselines — which is exactly the generalizable knowledge we want.
+
+### 6.3 Practical Considerations
+
+- **Epoch count:** 3–5 epochs is typical. More epochs risk overfitting the shared weights to the training period's specific event sequence.
+- **Stochasticity across epochs:** The event/article ordering within a single day can be shuffled between epochs (since intra-day ordering is arbitrary). This provides mild data augmentation without violating temporal ordering.
+- **Checkpoint strategy:** Save shared weights + baselines after each epoch. The best checkpoint is selected on validation performance (see Section 5.9).
+
+---
+
+## 7. Loss Functions (Detailed)
+
+### 7.1 DeepHit Survival Loss (Primary — Survival-Target Types)
 
 ```python
 def deephit_loss(
@@ -533,7 +645,7 @@ def deephit_loss(
     return L_nll + eta * L_ranking
 ```
 
-### 6.2 Hawkes NLL (Primary — Intensity-Target Types)
+### 7.2 Hawkes NLL (Primary — Intensity-Target Types)
 
 ```python
 def hawkes_nll(
@@ -566,7 +678,7 @@ def hawkes_nll(
     return -(ll - integral)
 ```
 
-### 6.3 Auxiliary Losses
+### 7.3 Auxiliary Losses
 
 ```python
 # Goldstein scale regression (for uncensored survival examples)
@@ -579,7 +691,7 @@ L_mem = lambda_mem * (h_i.norm().pow(2) + h_j.norm().pow(2))  # λ_mem = 0.01
 L_gate = lambda_gate * model.get_gate_penalty()  # λ_gate = 0.01
 ```
 
-### 6.4 Total Loss
+### 7.4 Total Loss
 
 The total loss depends on example type:
 
@@ -602,30 +714,33 @@ Both are weighted by `temporal_weight * event_type_weight` before aggregation.
 
 ---
 
-## 7. Checkpointing and Reproducibility
+## 8. Checkpointing and Reproducibility
 
-### 7.1 Checkpoint Contents
+### 8.1 Checkpoint Contents
 
 Every evaluation epoch, save:
 
 | Artifact | Contents |
 |----------|----------|
-| `model_weights.pt` | All model parameters |
-| `optimizer_state.pt` | Optimizer state (for resuming) |
-| `memory_state.pt` | Current actor memory vectors H |
+| `model_weights.pt` | All shared model parameters (encoder, projections, heads, etc.) |
+| `actor_baselines.pt` | Per-actor `h_baseline_i` vectors (the only actor-specific learned values) |
+| `optimizer_state.pt` | Optimizer state (for resuming training) |
 | `training_config.json` | All hyperparameters, random seeds, data version |
 | `metrics.json` | Validation metrics at this checkpoint |
 
-### 7.2 Reproducibility
+Note: actor memory vectors `h_i(t)` are **not** checkpointed between epochs — they are recomputed from baselines during each rollout. They are only checkpointed mid-epoch for crash recovery.
+
+### 8.2 Reproducibility
 
 - **Random seeds:** Fix PyTorch, NumPy, and Python random seeds at the start of each phase.
 - **Data ordering:** Events and articles are processed in strict chronological order (deterministic).
 - **Data version:** Record the data manifest hash from Component 1 in the training config.
 - **Code version:** Record the git commit hash.
 
-### 7.3 Best Model Selection
+### 8.3 Best Model Selection
 
 After Phase 3 training completes:
 1. Identify the checkpoint with the best **aggregate validation metric**: weighted combination of C-index (survival types) and Hawkes NLL (intensity types), plus Brier score at 30-day horizon derived from the CDF.
-2. Load that checkpoint's weights and memory state.
-3. Pass to Component 6 (Validation & Calibration) for final evaluation on the held-out test set.
+2. Load that checkpoint's shared weights and actor baselines.
+3. For validation/test evaluation: run a fresh chronological rollout through the relevant period, starting from baselines. This mirrors production inference.
+4. Pass to Component 6 (Validation & Calibration) for final evaluation on the held-out test set.
