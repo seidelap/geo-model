@@ -43,22 +43,50 @@ The full memory store is a matrix H of shape `[N_actors, d]` plus metadata. For 
 
 ### 2.2 Temporal Decay
 
-Between updates, memory decays toward the actor's baseline — a fixed vector computed from structural features and name encoding through learned projections (see Component 2, Section 3.5 and Section 11.2 below):
+Between updates, memory decays toward the actor's baseline. The baseline itself is not fixed — it evolves as a slow-moving exponential moving average (EMA) of the actor's memory, tracking gradual shifts in the actor's structural position over time. Memory decays toward this moving target, not toward a static point from t=0.
 
 ```python
-def apply_decay(h_i: Tensor, t_last: float, t_now: float, lambda_decay: float, h_baseline_i: Tensor) -> Tensor:
+def apply_decay(
+    h_i: Tensor,
+    b_i: Tensor,            # current EMA baseline for actor i
+    t_last: float,
+    t_now: float,
+    lambda_decay: float,
+) -> Tensor:
     """
-    Exponential decay toward per-actor baseline.
+    Exponential decay toward per-actor EMA baseline.
     lambda_decay corresponds to a half-life: t_half = ln(2) / lambda_decay
     Target half-life: 90–180 days (λ ≈ 0.004–0.008 per day)
     """
     dt = t_now - t_last  # in days
     decay_factor = math.exp(-lambda_decay * dt)
-    h_decayed = h_baseline_i + decay_factor * (h_i - h_baseline_i)
+    h_decayed = b_i + decay_factor * (h_i - b_i)
     return h_decayed
+
+
+def update_baseline(b_i: Tensor, h_i: Tensor, alpha_baseline: float) -> Tensor:
+    """
+    EMA update to the actor's baseline. Runs once per day, after all
+    memory updates (Layers 2, 3, 4) for that day are complete.
+
+    alpha_baseline is close to 1 (e.g., 0.99), so the baseline moves
+    much more slowly than memory. This is a shared learned scalar,
+    constrained to (0.95, 1.0) via sigmoid reparameterization:
+        alpha_baseline = 0.95 + 0.05 * sigmoid(alpha_raw)
+    """
+    b_i_new = alpha_baseline * b_i + (1 - alpha_baseline) * h_i
+    return b_i_new
 ```
 
-`h_baseline_i` is computed from the actor's structural features and name encoding through learned shared projections (see Component 2, Section 3.5). It represents the actor's "resting state" — what the model assumes about the actor in the absence of recent information. It is not a free parameter; it is recomputed deterministically at the start of each epoch.
+**Two-timescale dynamics:** The memory `h_i` operates on a fast timescale — updated daily by articles, events, and self-attention, decaying toward the baseline between updates. The baseline `b_i` operates on a slow timescale — a weighted average of recent memory states. With `alpha_baseline ≈ 0.99`, the baseline's effective half-life is ~69 days (`ln(2) / (1 - 0.99)`), meaning it tracks drift over months rather than days. This means:
+- A **one-off spike** (a single dramatic event) barely moves the baseline. Memory decays back toward the pre-spike normal.
+- A **sustained shift** (e.g., a sanctions regime change) gradually pulls the baseline to reflect the new normal. After several months, the decay target has moved — the model no longer tries to pull memory back to a pre-sanctions resting state.
+
+**Causality guarantee:** The baseline at time t depends only on memory states from times ≤ t. No future information can leak backward through the EMA. This is the same causal guarantee that Adam's momentum terms provide — the running average is strictly a function of past gradients.
+
+**Initialization:** At epoch start, `b_i(0) = h_baseline_init_i`, the structural projection baseline computed from the actor's fixed features and name encoding (see Component 2, Section 3.5 and Section 11.2 below). The EMA then evolves from there as the rollout proceeds. The structural projection provides a meaningful starting point; the EMA allows it to drift.
+
+**`alpha_baseline` parameterization:** A single shared learned scalar, constrained to (0.95, 1.0) via sigmoid reparameterization. This range ensures the baseline always moves substantially slower than the memory decay rate. If the optimizer finds that a nearly-fixed baseline works best, α will push toward 1.0. If faster adaptation helps, it can move toward 0.95 (half-life ~14 days). The constraint prevents degenerate solutions where the baseline simply tracks memory in real time (which would eliminate the decay mechanism entirely).
 
 ### 2.3 Storage
 
@@ -137,7 +165,7 @@ def encode_document(article_text: str) -> Tensor:
 
 ### 3.5 Actor Memory Cross-Attention Over Document
 
-Each relevant actor uses its current memory vector as a query to attend over the full encoded document. There is no mention extraction, no NER, and no separate event context pathway. The memory vector `h_i` already encodes everything the actor knows — its name (baked into `h_baseline_i` via Component 2, Section 3.5), its structural profile, and its accumulated history from *both* the text and event streams. The two streams share the same memory, so event-stream updates naturally inform the next text-stream read and vice versa.
+Each relevant actor uses its current memory vector as a query to attend over the full encoded document. There is no mention extraction, no NER, and no separate event context pathway. The memory vector `h_i` already encodes everything the actor knows — its name (baked into `h_baseline_init_i` via Component 2, Section 3.5, and preserved through the EMA baseline), its structural profile, and its accumulated history from *both* the text and event streams. The two streams share the same memory, so event-stream updates naturally inform the next text-stream read and vice versa.
 
 ```python
 def actor_reads_document(
@@ -172,14 +200,14 @@ def actor_reads_document(
 ```
 
 **How the actor knows who it is — two sources in the query:**
-1. **Name encoding** (from `h_baseline_i`, see Component 2, Section 3.5): Gives lexical affinity — Russia's query attends more to tokens like "Russia", "Moscow", "Kremlin" because its baseline encodes its name through ConfliBERT. This persists through decay: even after long periods without updates, the baseline (and thus the name signal) remains.
+1. **Name encoding** (from `h_baseline_init_i`, see Component 2, Section 3.5): Gives lexical affinity — Russia's query attends more to tokens like "Russia", "Moscow", "Kremlin" because its baseline initialization encodes its name through ConfliBERT. This signal persists even as the EMA baseline drifts, because the name encoding is a component of the structural projection that anchors the baseline's starting point, and the EMA's slow update rate preserves it.
 2. **Accumulated memory** (`h_i`): Encodes the actor's full recent history from both streams. A country that just processed a FIGHT event via the GRU (Layer 3) has a different memory state than one processing COOP events — and this shifts its attention pattern when reading the next article.
 
 **Cross-stream interaction via shared memory:** The text and event streams don't need an explicit bridge because they write to the same `h_i`. Within each simulated day (see Component 5, Section 5.3), the processing order is: articles first (Layer 2), then structured events (Layer 3), then actor self-attention (Layer 4). Each step sees the cumulative effect of all prior steps that day. Across days, the previous day's event-stream updates are fully reflected in `h_i` when the next day's articles are read.
 
 **Role-specific projections (Q/K/V):** The single memory vector `h_i` serves multiple roles — as a query when reading documents, as a key/value when participating in actor self-attention, and as input to the prediction head. Learned projection matrices (W_Q, W_K, W_V, etc.) create role-specific views of the same underlying state. This is the standard transformer approach: one representation, multiple projections. If capacity becomes a bottleneck (e.g., self-attention quality degrades text reading), we can split into separate vectors later, but the single-vector design is simpler and avoids the question of which vector the GRU writes to.
 
-**Why this works for new entities:** A newly added actor starts with `h_baseline_i`, which includes the name encoding (lexical anchor) and structural/text-derived features (neighborhood anchor). The first few articles and events rapidly specialize the memory from there.
+**Why this works for new entities:** A newly added actor starts with `h_baseline_init_i`, which includes the name encoding (lexical anchor) and structural/text-derived features (neighborhood anchor). The first few articles and events rapidly specialize the memory, and the EMA baseline begins tracking the actor's emerging identity from there.
 
 **Compared to the alternatives:**
 - No mention spans to find → no NER errors, no pipeline fragility
@@ -214,8 +242,8 @@ def update_memory_from_text(
     # Candidate update (residual)
     delta_h = MLP_update(update_input)  # [d]
 
-    # Apply temporal decay first, then add gated update
-    h_decayed = apply_decay(h_i, t_last, t, lambda_decay, h_baseline_i)
+    # Apply temporal decay toward EMA baseline, then add gated update
+    h_decayed = apply_decay(h_i, b_i, t_last, t, lambda_decay)
     h_new = h_decayed + gate_dims * (gate_scalar * delta_h)
 
     return h_new
@@ -230,7 +258,8 @@ def update_memory_from_text(
 - W_scalar: scalar gate, d × 1
 - W_dims: dimensional gate, d × d
 - MLP_update: 2-layer MLP, d × 4d × d
-- h_baseline per actor: N_actors × d (computed from fixed inputs through shared projections; see Component 2, Section 3.5 and Section 11 below)
+- h_baseline_init per actor: N_actors × d (computed from fixed inputs through shared projections; see Component 2, Section 3.5 and Section 11 below)
+- alpha_baseline: 1 (shared learned EMA decay rate for baseline updates; see Section 2.2)
 - time2vec parameters: time_dim
 
 ---
@@ -724,7 +753,8 @@ relation_embeddings.weight.data[:, 1:] = torch.randn(18, d - 1) * 0.01
 | Hawkes excitation | ~7K | 18×18 cross-excitation + 18 decay rates |
 | Intensity head (high-freq types) | ~0.2M | Base rate MLP for rate-based types |
 | Relation embeddings | ~5K | 18 × d |
-| Baseline projections (W_struct, W_text) | ~0.2M | Shared projections for computing h_baseline_i |
+| Baseline projections (W_struct, W_text) | ~0.2M | Shared projections for computing h_baseline_init_i |
+| `alpha_baseline` | 1 | EMA baseline decay rate (shared scalar) |
 | Time2Vec (2 instances) | ~64 | Tiny |
 | **Total (excluding encoder)** | **~10M** | |
 | **Total (including encoder)** | **~120M** | |
@@ -744,11 +774,12 @@ These are **state variables**, not learned parameters. They are populated during
 | Value | Shape | Description | In Optimizer? |
 |-------|-------|-------------|---------------|
 | `h_i(t)` | `[d]` per actor | Actor memory vector. Evolves through the rollout via Layers 2, 3, 4. | **No.** This is computed state, not a gradient-updated parameter. |
+| `b_i(t)` | `[d]` per actor | EMA baseline vector. Updated once per day as a slow-moving average of `h_i`. Memory decays toward this. | **No.** This is computed state, evolved via the EMA update rule. |
 | `t_last_updated_i` | scalar per actor | Timestamp of last memory update. Used for temporal decay. | No. |
 
-**At epoch start:** For each actor i, set `h_i(0) = h_baseline_i` and `t_last_updated_i = epoch_start_date`. The rollout then evolves memories forward through time. Gradients flow through the memory updates (within each TBPTT window), but the memory values themselves are never carried from one epoch to the next.
+**At epoch start:** For each actor i, set `h_i(0) = h_baseline_init_i` (the structural projection baseline), `b_i(0) = h_baseline_init_i`, and `t_last_updated_i = epoch_start_date`. Both memory and EMA baseline start from the same structural projection, then diverge as the rollout proceeds. Gradients flow through both the memory and baseline updates (within each TBPTT window), but neither is carried from one epoch to the next.
 
-**Why reset?** Each epoch replays the full training period chronologically. If memories from the previous epoch persisted, the actor states at time t would contain information from events after t (from the previous epoch's rollout). This is temporal leakage. Resetting ensures the model can only use information from the past within each rollout.
+**Why reset?** Each epoch replays the full training period chronologically. If memories or baselines from the previous epoch persisted, the actor states at time t would contain information from events after t (from the previous epoch's rollout). This is temporal leakage. Resetting ensures the model can only use information from the past within each rollout.
 
 ### 11.2 Actor-Specific Computed Values (Deterministic, Not Directly Optimized)
 
@@ -756,16 +787,18 @@ These are **computed from fixed inputs through learned shared projections**. The
 
 | Value | Shape | Description | In Optimizer? |
 |-------|-------|-------------|---------------|
-| `h_baseline_i` | `[d]` per actor | Resting state that memory decays toward. Computed from the actor's structural features and name encoding via learned projections (Component 2, Section 3.5). Represents the actor's "default disposition" and lexical identity. | **No.** Computed deterministically from fixed inputs. Gradients flow through to the shared projections. |
+| `h_baseline_init_i` | `[d]` per actor | Structural projection baseline. Initializes both `h_i(0)` and `b_i(0)` at epoch start. Computed from the actor's structural features and name encoding via learned projections (Component 2, Section 3.5). | **No.** Computed deterministically from fixed inputs. Gradients flow through to the shared projections. |
 | `sketch_i` | `[sketch_dim]` per actor | TF-IDF sketch vector for text relevance filtering. | **No.** Recomputed periodically (see Component 2, Section 4.2). Not learned by gradient descent. |
 
-**`h_baseline_i` details:** This is a deterministic function of the actor's fixed inputs (structural features, name) passed through learned shared projections:
+**`h_baseline_init_i` details:** This is a deterministic function of the actor's fixed inputs (structural features, name) passed through learned shared projections:
 
 ```python
-h_baseline_i = f(structural_features_i, name_i; W_struct, W_name, W_gate)
+h_baseline_init_i = f(structural_features_i, name_i; W_struct, W_name, W_gate)
 ```
 
-The projections (W_struct, W_name, W_gate) are shared across all actors and updated by the optimizer. The per-actor vectors are recomputed from these projections at the start of each epoch. This design prevents temporal leakage: if `h_baseline_i` were a free parameter directly tuned by gradients from predictions at time t=2000, it could encode actor-specific future information that then initializes the rollout at t=0. Constraining baselines to be functions of fixed inputs through shared projections ensures the model can only learn generalizable structure ("how to map structural features to useful starting geometry"), not actor-specific temporal signals.
+The projections (W_struct, W_name, W_gate) are shared across all actors and updated by the optimizer. The per-actor vectors are recomputed from these projections at the start of each epoch. This design prevents temporal leakage: if the initialization were a free parameter directly tuned by gradients from predictions at time t=2000, it could encode actor-specific future information that then initializes the rollout at t=0. Constraining the initialization to be a function of fixed inputs through shared projections ensures the model can only learn generalizable structure ("how to map structural features to useful starting geometry"), not actor-specific temporal signals.
+
+**Relationship to the EMA baseline:** `h_baseline_init_i` provides the starting point for the EMA baseline `b_i(t)`. During the rollout, `b_i(t)` evolves as a slow-moving average of the actor's memory (see Section 2.2). The structural projection anchors where each actor *starts*; the EMA tracks where each actor *drifts to*. Memory always decays toward the current EMA baseline `b_i(t)`, not toward the static initialization.
 
 ### 11.3 Shared Learned Parameters (Persist Across Epochs)
 
@@ -785,25 +818,29 @@ All transformation weights are shared across actors. When the model applies `W_Q
 | Relation embeddings | Embedding(18, d) | Yes |
 | Time2Vec | 2 instances, all frequency/phase parameters | Yes |
 | `lambda_decay` | Scalar (shared) or per-type (18 values) | Yes |
+| `alpha_baseline` | Scalar (shared). Constrained to (0.95, 1.0) via sigmoid reparameterization. | Yes |
 
-**Key invariant:** No shared parameter depends on actor identity. The same GRU processes events for Russia and for Luxembourg. Actor-specific behavior emerges entirely from the actor-specific state (`h_i`, `h_baseline_i`) flowing through shared transformations.
+**Key invariant:** No shared parameter depends on actor identity. The same GRU processes events for Russia and for Luxembourg. Actor-specific behavior emerges entirely from the actor-specific state (`h_i`, `b_i`, `h_baseline_init_i`) flowing through shared transformations.
 
 ### 11.4 Epoch Structure Summary
 
 ```
 Epoch k:
-  1. Reset all h_i(t) ← h_baseline_i for every actor i
-  2. Reset all t_last_updated_i ← training_start_date
-  3. Rollout chronologically through the training period:
+  1. Recompute h_baseline_init_i from fixed inputs through updated projections for every actor i
+  2. Reset all h_i(0) ← h_baseline_init_i
+  3. Reset all b_i(0) ← h_baseline_init_i  (EMA baseline starts at structural projection)
+  4. Reset all t_last_updated_i ← training_start_date
+  5. Rollout chronologically through the training period:
      a. For each day t in [train_start, train_end]:
         - Process all articles for day t (Layer 2: actor reads document → gated update)
         - Process all structured events for day t (Layer 3: GRU update)
         - Run actor self-attention (Layer 4: all actors attend to all others)
-        - Every K steps: compute loss, backprop (TBPTT), update shared params (including baseline projections)
-  4. Evaluate on validation set
-  5. Checkpoint shared parameters
+        - Update EMA baselines: b_i(t) ← alpha_baseline * b_i(t-1) + (1 - alpha_baseline) * h_i(t)
+        - Every K steps: compute loss, backprop (TBPTT), update shared params
+  6. Evaluate on validation set
+  7. Checkpoint shared parameters
 
-Shared parameters (including baseline projections W_struct, W_name, W_gate) carry over to epoch k+1.
-h_baseline_i is recomputed from fixed inputs through the updated projections at each epoch start.
-h_i(t) and t_last_updated_i do NOT carry over — they are recomputed from scratch.
+Shared parameters (including baseline projections W_struct, W_name, W_gate and alpha_baseline) carry over to epoch k+1.
+h_baseline_init_i is recomputed from fixed inputs through the updated projections at each epoch start.
+h_i(t), b_i(t), and t_last_updated_i do NOT carry over — they are recomputed from scratch.
 ```
