@@ -80,8 +80,10 @@ Extract information from news articles and update actor memory vectors. This is 
 Curated article
   → Sketch-based actor relevance filter (CPU, fast)
   → Full document encoding with ConfliBERT (GPU)
-  → Actor memory cross-attention over document (each relevant actor queries the document)
-  → Gated memory update
+  → For each relevant actor:
+      Compute recent event context (from Layer 3 outputs)
+      → Actor memory + event context cross-attention over document
+      → Gated memory update
 ```
 
 ### 3.3 Sketch-Based Actor Relevance Filter
@@ -136,23 +138,29 @@ def encode_document(article_text: str) -> Tensor:
 
 ### 3.5 Actor Memory Cross-Attention Over Document
 
-Each relevant actor uses its current memory vector as a query to attend over the full encoded document. There is no mention extraction or NER — the actor's memory determines what it attends to.
+Each relevant actor uses its current memory vector — combined with a summary of its recent structured events — as a query to attend over the full encoded document. There is no mention extraction or NER. Instead, the actor's identity (via name encoding baked into `h_baseline`, see Component 2, Section 3.5), current state, and recent event context jointly determine what it attends to.
 
 ```python
 def actor_reads_document(
     h_i: Tensor,           # current actor memory [d]
+    e_i_recent: Tensor,    # recent event context for this actor [d_e]
     T: Tensor,             # encoded document [seq_len, 768]
 ) -> Tensor:
     """
     Actor i reads the document by cross-attending over all tokens.
 
-    The actor's memory is the query. The document tokens are keys/values.
-    What the actor extracts depends on its current state — a country
-    in a security crisis attends to different tokens than one in a
-    trade negotiation, even in the same article.
+    The query is built from two sources:
+    1. h_i: the actor's memory, which encodes its name (from baseline),
+       structural profile, and accumulated history of articles/events
+    2. e_i_recent: a summary of recent structured events involving this
+       actor, providing a sharp prior on what to look for in the article
+
+    This cross-stream grounding is critical: the event stream tells you
+    WHO did WHAT to WHOM with high confidence (POLECAT has explicit actor
+    codes). The text stream fills in WHY, HOW, and WHAT NEXT.
     """
-    # Project actor memory to query space
-    query = W_Q(h_i)              # [d_k]
+    # Combine memory and recent event context into the query
+    query = W_Q(torch.cat([h_i, e_i_recent]))  # [d_k]
 
     # Project document tokens to key/value space (shared across all actors)
     keys = W_K(T)                 # [seq_len, d_k]
@@ -164,18 +172,60 @@ def actor_reads_document(
     m_i = attn_weights @ values                     # [d_v]
 
     return m_i  # what actor i extracted from this document
+
+
+def compute_recent_event_context(actor_id: str, date: date, window_days: int = 7) -> Tensor:
+    """
+    Summarize recent structured events involving this actor.
+
+    Returns a fixed-size vector encoding the event types, counterparties,
+    and intensity of recent interactions. This gives the text cross-attention
+    a sharp prior — if Russia had a FIGHT event with Ukraine yesterday,
+    the query will attend more strongly to conflict-related tokens.
+    """
+    recent_events = get_events_involving(actor_id, date - window_days, date)
+
+    if len(recent_events) == 0:
+        return torch.zeros(d_e)  # no recent events → neutral context
+
+    # Encode each event: relation embedding + counterparty memory + Goldstein
+    event_encodings = []
+    for event in recent_events:
+        counterparty_id = event.target_actor_id if event.source_actor_id == actor_id else event.source_actor_id
+        e = torch.cat([
+            relation_embedding(event.event_type),        # [d_rel]
+            H[counterparty_id].detach(),                 # [d] — detached, no gradient through this path
+            time2vec(date - event.date),                 # [d_time]
+            torch.tensor([event.goldstein_scale]),       # [1]
+        ])
+        event_encodings.append(e)
+
+    # Aggregate via attention-weighted sum (learnable)
+    E = torch.stack(event_encodings)          # [n_events, d_enc]
+    attn = softmax(W_event_attn @ E.T)       # [n_events]
+    e_i_recent = attn @ E                     # [d_enc]
+
+    return MLP_event_context(e_i_recent)      # [d_e] — projected to event context dim
 ```
 
-**Why this works:**
-- No NER or entity linking needed. The model learns what to attend to from the training signal.
-- The actor's current state determines its attention pattern. A country that just had a coup will attend differently than one in a stable period, even in the same article.
-- Cross-actor interaction is implicit: if Russia and Ukraine both read the same article, their memory updates are coupled through the shared document encoding and through the subsequent graph propagation step.
-- **New entities** work naturally: a newly added actor starts with its initial embedding from Component 2 (structural projection or text-derived). This generic embedding serves as the first attention query. The query will be broad at first, but the gating mechanism (Section 3.6) controls how much signal gets through, and after a few articles the memory specializes.
+**Three sources of actor identity in the query:**
+1. **Name encoding** (from `h_baseline_i`, see Component 2, Section 3.5): Gives lexical affinity — Russia's query attends more to tokens like "Russia", "Moscow", "Kremlin" because its baseline encodes its name through ConfliBERT.
+2. **Accumulated memory** (`h_i`): Encodes the actor's recent history. A country in a security crisis attends differently than one in a trade negotiation, even in the same article.
+3. **Recent event context** (`e_i_recent`): Cross-stream grounding. If POLECAT recorded `SANCTION(USA, Russia)` yesterday, the event context vector sharpens the query toward sanction-related language in today's articles.
+
+**Why the event context matters:** Without it, the text stream operates in isolation — the model must rediscover from article text what the event stream already knows explicitly. With it, the event stream provides high-confidence, low-latency facts (who, what, whom) that help the text stream focus on extracting what structured coding misses (why, how, what's implied, what might happen next).
+
+**Why this works for new entities:** A newly added actor starts with:
+- Name encoding: immediate lexical anchor from Component 2
+- Memory: `h_baseline_i` (structural or text-derived, generic but in the right neighborhood)
+- Event context: zero vector initially (no events yet), so the query relies on name + baseline
+
+After the first few events and articles, all three components are populated and the query sharpens.
 
 **Compared to the alternatives:**
 - No mention spans to find → no NER errors, no pipeline fragility
 - No pairwise cross-actor attention → O(A) per article instead of O(A²), where A is the number of relevant actors
-- No per-actor-type query vectors for unmentioned actors → uniform mechanism for all actors
+- Event context is computed from already-processed structured events → no additional data dependency, just reusing Layer 3 outputs
 
 ### 3.6 Gated Memory Update
 
@@ -214,14 +264,16 @@ def update_memory_from_text(
 
 **Learnable parameters in this layer:**
 - ConfliBERT encoder: 110M params (fine-tuned, not frozen)
-- W_Q: d × d_k (actor memory → query projection)
+- W_Q: (d + d_e) × d_k (actor memory + event context → query projection)
 - W_K: 768 × d_k (document tokens → key projection)
 - W_V: 768 × d_v (document tokens → value projection)
+- W_event_attn: d_enc × 1 (attention over recent events)
+- MLP_event_context: d_enc × d_e (project event summary to context dim)
 - W_proj: input projection, (d + d_v + time_dim) × d
 - W_scalar: scalar gate, d × 1
 - W_dims: dimensional gate, d × d
 - MLP_update: 2-layer MLP, d × 4d × d
-- h_baseline per actor: N_actors × d (actor-specific, see Section 11)
+- h_baseline per actor: N_actors × d (actor-specific, includes name encoding; see Section 11)
 - time2vec parameters: time_dim
 
 ---
@@ -784,7 +836,7 @@ These are **learned parameters** — they have gradients and are updated by the 
 
 | Value | Shape | Description | In Optimizer? |
 |-------|-------|-------------|---------------|
-| `h_baseline_i` | `[d]` per actor | Learned resting state that memory decays toward. Represents the actor's "default disposition." Initialized from structural embedding (Component 2). | **Yes.** |
+| `h_baseline_i` | `[d]` per actor | Learned resting state that memory decays toward. Includes name identity encoding (Component 2, Section 3.5). Represents the actor's "default disposition" and lexical identity. | **Yes.** |
 | `sketch_i` | `[sketch_dim]` per actor | TF-IDF sketch vector for text relevance filtering. | **No.** Recomputed periodically (see Component 2, Section 4.2). Not learned by gradient descent. |
 
 **`h_baseline_i` details:** This is the key actor-specific learned value. It captures what the model thinks actor i looks like in the absence of recent information. The optimizer adjusts it so that `apply_decay(h_i, ...)` produces useful starting points. Because it represents a time-invariant property (the actor's structural identity), it does not leak temporal information across epochs.
@@ -796,7 +848,9 @@ All transformation weights are shared across actors. When the model applies `W_Q
 | Component | Parameters | In Optimizer? |
 |-----------|-----------|---------------|
 | ConfliBERT encoder | All 110M BERT weights | Yes (lr=1e-5) |
-| Cross-attention projections | W_Q (d × d_k), W_K (768 × d_k), W_V (768 × d_v) | Yes |
+| Cross-attention projections | W_Q ((d+d_e) × d_k), W_K (768 × d_k), W_V (768 × d_v) | Yes |
+| Event context aggregation | W_event_attn, MLP_event_context | Yes |
+| Name encoding projection | W_name (768 × d), b_name, W_gate (2d × d) | Yes |
 | Memory update gate/MLP | W_proj, W_scalar, W_dims, MLP_update | Yes |
 | GRU cells | GRU_source, GRU_target (all internal weights) | Yes |
 | Graph attention layers | W_r (18 per layer), a_r (18 per layer), LayerNorm | Yes |

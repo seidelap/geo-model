@@ -251,6 +251,66 @@ def init_neighbor_embedding(actor_id: str, d: int) -> np.ndarray:
 
 This is the weakest initialization and should only be used as a fallback. The model will update these vectors quickly from event data once training begins.
 
+### 3.5 Name Identity Encoding
+
+Every actor, regardless of initialization path, receives a name encoding vector that gives the model a lexical anchor for connecting actors to their mentions in text.
+
+```python
+def compute_name_encoding(actor: Actor, d: int) -> Tensor:
+    """
+    Encode an actor's canonical name and aliases through ConfliBERT.
+
+    This gives the model a direct lexical hook — when the actor later
+    cross-attends over a document (Component 4, Layer 2), its query
+    vector includes information about what its name looks like as text.
+    Without this, two structurally similar countries (e.g., Czech Republic
+    and Slovakia) would attend to documents identically at initialization.
+    """
+    # Collect name variants
+    name_texts = [actor.name] + actor.aliases  # e.g., ["Russia", "Russian Federation", "РФ"]
+
+    # Encode each variant through ConfliBERT (frozen at this stage)
+    name_embeddings = []
+    for name in name_texts:
+        tokens = tokenizer(name, return_tensors="pt")
+        emb = conflibert(**tokens).last_hidden_state.mean(dim=1)  # [768]
+        name_embeddings.append(emb)
+
+    # Average across variants, project to embedding dimension
+    avg_name = torch.stack(name_embeddings).mean(dim=0)  # [768]
+    name_enc = W_name @ avg_name + b_name                # [d]
+
+    return name_enc
+```
+
+**Integration with initialization paths:**
+
+All three paths (A, B, C) produce a base embedding from structural/text/neighbor features. The name encoding is added as a separate component:
+
+```python
+def init_actor_embedding(actor: Actor, d: int) -> Tensor:
+    # 1. Compute base embedding via appropriate path
+    if has_structural_features(actor):
+        h_base = init_state_embedding(actor, d)      # Path A
+    elif has_text(actor):
+        h_base = init_text_embedding(actor, d)        # Path B
+    else:
+        h_base = init_neighbor_embedding(actor, d)    # Path C
+
+    # 2. Add name encoding (all actors get this)
+    h_name = compute_name_encoding(actor, d)
+
+    # 3. Combine via learned gated addition
+    gate = sigmoid(W_gate @ torch.cat([h_base, h_name]))  # [d]
+    h_i_0 = h_base + gate * h_name
+
+    return h_i_0  # this becomes h_baseline_i
+```
+
+**Why gated addition, not concatenation:** Concatenation would double the embedding dimension. The gate lets the model learn how much weight to give the name encoding vs. structural features per dimension. For states with rich structural data, the gate may be small. For newly added non-state actors, the name encoding may dominate initially.
+
+**Why this matters for cross-attention:** When this actor later queries a document via `W_Q @ h_i`, the name encoding means the query vector has affinity for tokens that resemble the actor's name. Russia's query vector will naturally attend more strongly to "Russia", "Russian", "Moscow", "Kremlin" — not because of a hardcoded rule, but because those tokens' ConfliBERT representations are similar to the name encoding that's baked into the memory.
+
 ---
 
 ## 4. Actor Sketch Vectors
