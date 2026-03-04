@@ -361,8 +361,7 @@ def phase3_epoch(model: FullModel, data: ChronologicalStream, K: int = 75):
             relevant_actors = model.filter_relevant_actors(article, active_actors)
             T = model.encode_document(article)
             for actor_id, weight in relevant_actors:
-                e_i = model.compute_recent_event_context(actor_id, day.date)
-                m_i = model.actor_reads_document(model.H[actor_id], e_i, T)
+                m_i = model.actor_reads_document(model.H[actor_id], T)
                 model.H[actor_id] = model.update_memory_from_text(
                     model.H[actor_id], m_i, day.date, model.t_last[actor_id]
                 )
