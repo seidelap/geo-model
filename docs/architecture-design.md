@@ -491,7 +491,7 @@ for i in active_actors:
 
 - **Residual rather than interpolation:** Rather than interpolating between old and new state (GRU-style), add a learned delta. This preserves direct gradient paths through the identity connection regardless of gate values.
 - **Separate scalar and dimensional gates:** The scalar gate handles “is this article relevant to this actor at all?” The dimensional gate handles “which aspects of this actor’s disposition does this article speak to?” These serve different purposes and use different functional forms.
-- **Exponential temporal decay:** Memory decays toward zero (or a learned baseline) between updates, reflecting that old information becomes less reliable. The decay constant λ corresponds to a half-life of roughly 3–6 months for geopolitical dispositions.
+- **Exponential temporal decay:** Memory decays toward a per-actor baseline (computed from structural features and name encoding through learned shared projections) between updates, reflecting that old information becomes less reliable. The decay constant λ corresponds to a half-life of roughly 3–6 months for geopolitical dispositions.
 
 -----
 

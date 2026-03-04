@@ -43,12 +43,12 @@ The full memory store is a matrix H of shape `[N_actors, d]` plus metadata. For 
 
 ### 2.2 Temporal Decay
 
-Between updates, memory decays toward a learned baseline:
+Between updates, memory decays toward the actor's baseline — a fixed vector computed from structural features and name encoding through learned projections (see Component 2, Section 3.5 and Section 11.2 below):
 
 ```python
 def apply_decay(h_i: Tensor, t_last: float, t_now: float, lambda_decay: float, h_baseline_i: Tensor) -> Tensor:
     """
-    Exponential decay toward a learned per-actor baseline.
+    Exponential decay toward per-actor baseline.
     lambda_decay corresponds to a half-life: t_half = ln(2) / lambda_decay
     Target half-life: 90–180 days (λ ≈ 0.004–0.008 per day)
     """
@@ -58,7 +58,7 @@ def apply_decay(h_i: Tensor, t_last: float, t_now: float, lambda_decay: float, h
     return h_decayed
 ```
 
-`h_baseline_i` is a learned parameter per actor (or per actor type). It represents the actor's "resting state" — what the model assumes about the actor in the absence of recent information. Initialized from the structural embedding.
+`h_baseline_i` is computed from the actor's structural features and name encoding through learned shared projections (see Component 2, Section 3.5). It represents the actor's "resting state" — what the model assumes about the actor in the absence of recent information. It is not a free parameter; it is recomputed deterministically at the start of each epoch.
 
 ### 2.3 Storage
 
@@ -230,7 +230,7 @@ def update_memory_from_text(
 - W_scalar: scalar gate, d × 1
 - W_dims: dimensional gate, d × d
 - MLP_update: 2-layer MLP, d × 4d × d
-- h_baseline per actor: N_actors × d (actor-specific, includes name encoding; see Component 2, Section 3.5 and Section 11 below)
+- h_baseline per actor: N_actors × d (computed from fixed inputs through shared projections; see Component 2, Section 3.5 and Section 11 below)
 - time2vec parameters: time_dim
 
 ---
@@ -724,7 +724,7 @@ relation_embeddings.weight.data[:, 1:] = torch.randn(18, d - 1) * 0.01
 | Hawkes excitation | ~7K | 18×18 cross-excitation + 18 decay rates |
 | Intensity head (high-freq types) | ~0.2M | Base rate MLP for rate-based types |
 | Relation embeddings | ~5K | 18 × d |
-| Actor baselines | ~0.1M | N_actors × d |
+| Baseline projections (W_struct, W_text) | ~0.2M | Shared projections for computing h_baseline_i |
 | Time2Vec (2 instances) | ~64 | Tiny |
 | **Total (excluding encoder)** | **~10M** | |
 | **Total (including encoder)** | **~120M** | |
@@ -750,16 +750,22 @@ These are **state variables**, not learned parameters. They are populated during
 
 **Why reset?** Each epoch replays the full training period chronologically. If memories from the previous epoch persisted, the actor states at time t would contain information from events after t (from the previous epoch's rollout). This is temporal leakage. Resetting ensures the model can only use information from the past within each rollout.
 
-### 11.2 Actor-Specific Learned Parameters (Persist Across Epochs)
+### 11.2 Actor-Specific Computed Values (Deterministic, Not Directly Optimized)
 
-These are **learned parameters** — they have gradients and are updated by the optimizer. They persist across epochs because they represent stable properties, not temporal state.
+These are **computed from fixed inputs through learned shared projections**. They are not directly in the optimizer — gradients flow through them to update the projections (W_struct, W_name, W_gate, etc.), but the per-actor vectors are never independently tuned.
 
 | Value | Shape | Description | In Optimizer? |
 |-------|-------|-------------|---------------|
-| `h_baseline_i` | `[d]` per actor | Learned resting state that memory decays toward. Includes name identity encoding (Component 2, Section 3.5). Represents the actor's "default disposition" and lexical identity. | **Yes.** |
+| `h_baseline_i` | `[d]` per actor | Resting state that memory decays toward. Computed from the actor's structural features and name encoding via learned projections (Component 2, Section 3.5). Represents the actor's "default disposition" and lexical identity. | **No.** Computed deterministically from fixed inputs. Gradients flow through to the shared projections. |
 | `sketch_i` | `[sketch_dim]` per actor | TF-IDF sketch vector for text relevance filtering. | **No.** Recomputed periodically (see Component 2, Section 4.2). Not learned by gradient descent. |
 
-**`h_baseline_i` details:** This is the key actor-specific learned value. It captures what the model thinks actor i looks like in the absence of recent information. The optimizer adjusts it so that `apply_decay(h_i, ...)` produces useful starting points. Because it represents a time-invariant property (the actor's structural identity), it does not leak temporal information across epochs.
+**`h_baseline_i` details:** This is a deterministic function of the actor's fixed inputs (structural features, name) passed through learned shared projections:
+
+```python
+h_baseline_i = f(structural_features_i, name_i; W_struct, W_name, W_gate)
+```
+
+The projections (W_struct, W_name, W_gate) are shared across all actors and updated by the optimizer. The per-actor vectors are recomputed from these projections at the start of each epoch. This design prevents temporal leakage: if `h_baseline_i` were a free parameter directly tuned by gradients from predictions at time t=2000, it could encode actor-specific future information that then initializes the rollout at t=0. Constraining baselines to be functions of fixed inputs through shared projections ensures the model can only learn generalizable structure ("how to map structural features to useful starting geometry"), not actor-specific temporal signals.
 
 ### 11.3 Shared Learned Parameters (Persist Across Epochs)
 
@@ -793,10 +799,11 @@ Epoch k:
         - Process all articles for day t (Layer 2: actor reads document → gated update)
         - Process all structured events for day t (Layer 3: GRU update)
         - Run actor self-attention (Layer 4: all actors attend to all others)
-        - Every K steps: compute loss, backprop (TBPTT), update shared params + h_baseline_i
+        - Every K steps: compute loss, backprop (TBPTT), update shared params (including baseline projections)
   4. Evaluate on validation set
-  5. Checkpoint shared parameters + h_baseline_i values
+  5. Checkpoint shared parameters
 
-Shared parameters and h_baseline_i carry over to epoch k+1.
+Shared parameters (including baseline projections W_struct, W_name, W_gate) carry over to epoch k+1.
+h_baseline_i is recomputed from fixed inputs through the updated projections at each epoch start.
 h_i(t) and t_last_updated_i do NOT carry over — they are recomputed from scratch.
 ```

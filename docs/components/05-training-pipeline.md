@@ -418,7 +418,7 @@ def activate_actor(model: FullModel, actor: Actor, date: date):
     # - Prediction queries: dyads involving it are now queryable
 ```
 
-**Where `h_baseline` comes from for new actors:** The baseline is initialized from Component 2 (structural projection for states, text-derived for leaders/orgs, neighbor average as fallback). During training, the optimizer updates `h_baseline` via gradients — but only from time steps *after* the actor is active.
+**Where `h_baseline` comes from for new actors:** The baseline is computed from the actor's fixed inputs (structural features, name encoding) through learned shared projections (Component 2, Section 3.5). It is not a free parameter — the optimizer updates the shared projections (`W_struct`, `W_name`, `W_gate`), not the per-actor vectors directly. This prevents temporal leakage from future predictions into the initial state.
 
 #### 5.4.2 Deactivating an Actor
 
@@ -464,13 +464,13 @@ The state's memory continues evolving; the new leader's actions
 will gradually shift the state embedding through events/articles.
 ```
 
-#### 5.4.4 Gradient Flow for Actor-Specific Baselines
+#### 5.4.4 Gradient Flow for Baseline Projections
 
 When computing losses for training examples that involve actor i:
 - Gradients flow through `h_i(t)` back through the memory update chain (within the TBPTT window)
 - At the start of the TBPTT window, `h_i` was either: (a) the output of a previous TBPTT window (detached), or (b) `h_baseline_i` (at epoch start or actor activation)
-- In case (b), the gradient reaches `h_baseline_i` and updates it. This is how the optimizer learns each actor's resting state.
-- Actors that appear in more training examples receive more gradient signal for their baselines. This is correct — we have more information about those actors.
+- In case (b), the gradient reaches `h_baseline_i` and flows through to the shared projections (`W_struct`, `W_name`, `W_gate`). This is how the optimizer learns how to map structural features and names into useful starting geometry.
+- Because the projections are shared across all actors, no single actor's gradients can push its baseline to encode actor-specific temporal information. The projections learn generalizable structure only.
 
 ### 5.5 Curriculum Learning
 
@@ -581,13 +581,13 @@ Every 5,000 steps, run evaluation on the validation set (Component 3, Section 6)
 Each epoch replays the entire training period from `train_start` to `train_end`. Between epochs:
 
 **Reset (actor-specific state):**
-- All `h_i(t)` → `h_baseline_i` (learned baseline)
+- All `h_baseline_i` recomputed from fixed inputs through updated projections
+- All `h_i(t)` → `h_baseline_i` (freshly computed)
 - All `t_last_updated_i` → `train_start_date`
 - Active actor set → recomputed from scratch based on `active_from` dates
 
 **Persist (learned parameters):**
-- `h_baseline_i` for every actor (updated by optimizer during the epoch)
-- All shared weights (encoder, projections, gates, GRUs, heads, etc.)
+- All shared weights: encoder, projections (including baseline projections W_struct, W_name, W_gate), gates, GRUs, heads, etc.
 - Optimizer state (momentum, adaptive learning rates)
 
 ### 6.2 Why Memory Reset Is Necessary
@@ -596,9 +596,9 @@ The model's value comes from learning shared transformations (how to update memo
 
 1. **Temporal leakage:** At the start of epoch k+1, `h_Russia(t=0)` would contain information from events at `t=2000 days` (end of epoch k). The model would start with future knowledge baked into its states.
 2. **Gradient confusion:** The optimizer would receive conflicting signals — gradients from early in the rollout would push memories one way, but the carried-over state already reflects the end of the previous epoch.
-3. **Baseline learning failure:** The optimizer would have no incentive to learn good `h_baseline_i` values, since memories would never actually start from baseline.
+3. **Projection learning failure:** The optimizer would have no incentive to learn good baseline projections, since memories would never actually start from baseline.
 
-By resetting, each epoch provides a clean forward pass. The only information that persists is encoded in the shared weights and baselines — which is exactly the generalizable knowledge we want.
+By resetting, each epoch provides a clean forward pass. The only information that persists is encoded in the shared weights (including the baseline projections) — which is exactly the generalizable knowledge we want.
 
 ### 6.3 Practical Considerations
 
@@ -721,13 +721,12 @@ Every evaluation epoch, save:
 
 | Artifact | Contents |
 |----------|----------|
-| `model_weights.pt` | All shared model parameters (encoder, projections, heads, etc.) |
-| `actor_baselines.pt` | Per-actor `h_baseline_i` vectors (the only actor-specific learned values) |
+| `model_weights.pt` | All shared model parameters (encoder, projections, heads, baseline projections, etc.) |
 | `optimizer_state.pt` | Optimizer state (for resuming training) |
 | `training_config.json` | All hyperparameters, random seeds, data version |
 | `metrics.json` | Validation metrics at this checkpoint |
 
-Note: actor memory vectors `h_i(t)` are **not** checkpointed between epochs — they are recomputed from baselines during each rollout. They are only checkpointed mid-epoch for crash recovery.
+Note: per-actor `h_baseline_i` vectors and actor memory vectors `h_i(t)` are **not** checkpointed — baselines are recomputed from fixed inputs through the learned projections, and memories are recomputed from baselines during each rollout. Actor memories are only checkpointed mid-epoch for crash recovery.
 
 ### 8.2 Reproducibility
 

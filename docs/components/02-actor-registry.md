@@ -60,7 +60,7 @@ Unmapped codes are logged to a review queue. Actors that accumulate ≥50 unmapp
 
 ### 2.1 Feature Vector for Nation-States
 
-For each state and each year, assemble the structural feature vector from Component 1's structural data output:
+For each state and each year, assemble the structural feature vector from Component 1's structural data output. **These are computed once before training** from the most recent available data for each feature (typically 1–2 years lagged — e.g., World Bank 2023 GDP released in late 2024). They are not updated during training or inference. Changes in structural conditions (GDP shifts, regime transitions) are captured by the text and event streams during the rollout, not by re-injecting structural features:
 
 ```python
 structural_features_state = [
@@ -306,6 +306,8 @@ def init_actor_embedding(actor: Actor, d: int) -> Tensor:
 
     return h_i_0  # this becomes h_baseline_i
 ```
+
+**`h_baseline_i` is a computed value, not a directly optimized parameter.** It is always a deterministic function of the actor's fixed inputs (structural features, name) passed through the learned projections (`W_struct`, `W_text`, `W_name`, `W_gate`). The optimizer updates the projections, not the per-actor vectors. This prevents temporal leakage: if `h_baseline_i` were directly tuned by gradients from predictions at time t=2000, it could encode future information that then initializes the rollout at t=0. By constraining baselines to be functions of fixed inputs through shared projections, the model can only learn generalizable structure ("how to map GDP into useful geometry"), not actor-specific temporal information.
 
 **Why gated addition, not concatenation:** Concatenation would double the embedding dimension. The gate lets the model learn how much weight to give the name encoding vs. structural features per dimension. For states with rich structural data, the gate may be small. For newly added non-state actors, the name encoding may dominate initially.
 
