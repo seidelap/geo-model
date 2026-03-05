@@ -69,28 +69,11 @@ Fixed-horizon probabilities (7-day, 30-day, etc.) are not separate model outputs
 - All horizon queries are internally consistent (P(30 days) ≥ P(7 days) is guaranteed by the survival function's monotonicity).
 - Benchmark comparisons at specific horizons (e.g., ViEWS monthly) just read the relevant CDF value.
 
-### 1.4 High-Frequency Event Types: Intensity Instead of Time-to-First
+### 1.4 High-Frequency Event Types
 
-For event types where occurrences are frequent (CONSULT, ENGAGE, COOP, DISAPPROVE — base rate >10% per active dyad-month), the time-to-first-event framing is uninformative because the survival curve drops to near zero within days.
+For event types where occurrences are frequent (CONSULT, ENGAGE, COOP, DISAPPROVE — base rate >10% per active dyad-month), the survival curve drops to near zero within days. This is the correct output — the model learns to predict near-certain short-term occurrence for these types, with the informative signal being the shape of the curve (how quickly it drops) rather than whether it drops at all.
 
-For these types, the model additionally outputs an **event intensity** (expected count per unit time) via a Hawkes process:
-
-```
-λ(t) = μ(h_i, h_j, r) + Σ_k α_r · exp(-β_r · (t - t_k))
-
-μ: base rate from actor states (learned)
-Σ: self-excitation from past events (events beget events)
-```
-
-The intensity provides a richer signal: not just "will consultation happen" (almost certainly yes) but "how much more consultation than usual is expected" (deviation from baseline rate).
-
-**Which event types use which framing:**
-
-| Primary framing | Event types | Rationale |
-|----------------|-------------|-----------|
-| Survival curve (time-to-event) | FIGHT, SANCTION, SEIZE, MOBILIZE, THREATEN, AID, AGREE, PROTEST | Rare or moderately rare — when it happens matters |
-| Intensity function (rate) | CONSULT, ENGAGE, COOP, DISAPPROVE | Common — rate variation is the informative signal |
-| Both (survival + intensity) | DEMAND, REDUCE, REJECT, YIELD | Borderline — evaluate empirically which framing performs better |
+All 18 event types use the same **survival curve** output. No separate intensity model is needed. Temporal clustering ("events beget events") is captured through the actor memory updates: recent events shift actor states via the GRU (Layer 3), causing the hazard logits to reflect elevated short-term risk. The shared architecture simplifies implementation while the per-type hazard heads learn type-specific temporal patterns from data.
 
 ---
 
@@ -551,27 +534,9 @@ class SurvivalTrainingExample:
 
 **Censoring:** When the observation window ends (at the train/val/test boundary) before an event occurs, the example is right-censored. The model learns that the event hadn't happened *yet* — it may or may not happen after the window. Survival models handle censoring natively; this is a core advantage over binary classification, which must discard or arbitrarily label censored examples.
 
-### 8.2 Intensity Target Example
+### 8.2 High-Frequency Event Types
 
-For event types modeled as rates (high-frequency types):
-
-```python
-@dataclass
-class IntensityTrainingExample:
-    source_actor_id: str
-    target_actor_id: str
-    event_type: str
-    period_start: date
-    period_end: date
-    event_times: list[float]     # list of exact event times within the period (days from period_start)
-    event_count: int             # len(event_times)
-    mean_goldstein: float
-    temporal_weight: float
-    event_type_weight: float
-    context_window_key: str
-```
-
-The intensity model is trained on the exact event times within each period, using the Hawkes process NLL (see Component 5).
+For high-frequency event types (CONSULT, ENGAGE, COOP, DISAPPROVE), the `SurvivalTrainingExample` schema is used identically. These types will have very short `days_to_event` values and high positive example counts. The survival head naturally learns near-zero short-term survival for these types from data.
 
 ---
 

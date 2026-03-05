@@ -159,9 +159,45 @@ def encode_document(article_text: str) -> Tensor:
     return T.squeeze(0)  # [seq_len, 768]
 ```
 
-**Model:** ConfliBERT (BERT-base, 12 layers, 110M params). Domain-adapted for conflict/political text. Available at `github.com/eventdata/ConfliBERT`.
+**Model:** ConfliBERT (BERT-base, 12 layers, 110M params). Domain-adapted for conflict/political text. Available at `github.com/eventdata/ConfliBERT`. Base weights are **frozen**; adaptation is via LoRA (see Section 3.4.1).
 
 **Throughput:** ~8,000–12,000 tokens/sec on T4; ~40,000 articles/day takes ~25–35 minutes.
+
+#### 3.4.1 LoRA Adapter Configuration
+
+ConfliBERT's 110M base parameters are frozen during all training phases. Adaptation uses **Low-Rank Adaptation (LoRA)** applied to the query and value projection matrices in each self-attention layer.
+
+```python
+# LoRA configuration for ConfliBERT
+lora_config = {
+    "r": 8,                          # rank of low-rank matrices
+    "lora_alpha": 16,                # scaling factor (effective scale = alpha/r = 2)
+    "target_modules": ["query", "value"],  # Q and V projections in each attention layer
+    "lora_dropout": 0.05,            # dropout on LoRA input
+    "bias": "none",                  # no bias adaptation
+    "modules_to_save": None,         # no additional modules unfrozen
+}
+```
+
+**Parameter breakdown:**
+- Each LoRA adapter adds two matrices per target module: `A [768, 8]` and `B [8, 768]`
+- Per attention layer: 2 target modules × 2 matrices × 768 × 8 = 24,576 params
+- 12 attention layers × 24,576 = ~295K params
+- With lora_alpha scaling and layer norms: **~0.6M trainable parameters** total
+
+**Rationale:**
+- Saves ~880MB optimizer states (Adam maintains 2 state tensors per parameter; freezing 110M params eliminates ~880MB)
+- TBPTT with K=75 days is more comfortable on 24GB VRAM
+- ConfliBERT is already domain-adapted for conflict text; LoRA provides task-specific fine-tuning without catastrophic forgetting
+- LoRA adapters tolerate higher learning rates than full fine-tuning: `lr=1e-4` for LoRA vs the `lr=1e-5` that full fine-tuning would require
+
+**Training phases:**
+- Phase 0: ConfliBERT not used (LightGBM baseline)
+- Phase 1 (structural pretrain): ConfliBERT frozen, LoRA disabled — only structural components trained
+- Phase 2 (self-supervised): LoRA adapters enabled and trained (`lr=1e-4`)
+- Phase 3 (supervised fine-tune): LoRA adapters continue training (`lr=1e-4`)
+
+**Implementation:** Use `peft` library (`from peft import LoraConfig, get_peft_model`) or manual implementation with `nn.Linear` wrappers. The `peft` approach is preferred for compatibility with HuggingFace checkpointing.
 
 ### 3.5 Actor Memory Cross-Attention Over Document
 
@@ -242,15 +278,14 @@ def update_memory_from_text(
     # Candidate update (residual)
     delta_h = MLP_update(update_input)  # [d]
 
-    # Apply temporal decay toward EMA baseline, then add gated update
-    h_decayed = apply_decay(h_i, b_i, t_last, t, lambda_decay)
-    h_new = h_decayed + gate_dims * (gate_scalar * delta_h)
+    # Gated residual update (no temporal decay here — decay is applied once per day)
+    h_new = h_i + gate_dims * (gate_scalar * delta_h)
 
     return h_new
 ```
 
 **Learnable parameters in this layer:**
-- ConfliBERT encoder: 110M params (fine-tuned, not frozen)
+- ConfliBERT encoder: 110M params (adapted via LoRA, ~0.6M trainable)
 - W_Q: d × d_k (actor memory → query projection)
 - W_K: 768 × d_k (document tokens → key projection)
 - W_V: 768 × d_v (document tokens → value projection)
@@ -412,6 +447,37 @@ class ActorPropagation(nn.Module):
 - Total per layer: ~12d² ≈ 0.8M at d=256
 - Total for 2 layers: ~1.6M params at d=256
 
+### 5.5 Daily Memory Maintenance
+
+At the end of each simulated day, after all articles (Layer 2) and events (Layer 3) have been processed, the following maintenance steps run in order:
+
+```python
+def daily_maintenance(model, active_actors, day_date):
+    """
+    Daily memory maintenance: decay, self-attention, EMA baseline update.
+    Called once per simulated day, after all articles and events are processed.
+    """
+    # 1. Temporal decay toward EMA baseline for all actors
+    for actor_id in active_actors:
+        dt = (day_date - model.t_last_decay[actor_id]).days
+        if dt > 0:
+            decay = math.exp(-model.lambda_decay * dt)
+            model.H[actor_id] = model.B[actor_id] + decay * (model.H[actor_id] - model.B[actor_id])
+            model.t_last_decay[actor_id] = day_date
+
+    # 2. Actor self-attention (Layer 4)
+    active_H = gather_active(model.H, active_actors)
+    updated_H = model.actor_propagation(active_H)
+    write_back_active(model.H, updated_H, active_actors)
+
+    # 3. EMA baseline update
+    for actor_id in active_actors:
+        model.B[actor_id] = model.alpha_baseline * model.B[actor_id] + \
+                            (1 - model.alpha_baseline) * model.H[actor_id]
+```
+
+**Why once per day:** Applying decay per-article or per-event would create inconsistency between the text and event streams — an actor updated by 50 articles would experience 50 micro-decays, while one updated by 5 events would experience only 5. Daily decay is stream-agnostic and aligns with the natural temporal granularity of the data (events and articles are date-stamped, not hour-stamped).
+
 ---
 
 ## 6. Layer 5: Event Prediction Head
@@ -489,6 +555,9 @@ class SurvivalHead(nn.Module):
             nn.Dropout(0.1),
         )
 
+        # Dropout before per-type heads (reduces overfitting for rare event types)
+        self.hazard_dropout = nn.Dropout(0.2)
+
         # Per-event-type hazard heads: each outputs K hazard values
         self.hazard_heads = nn.ModuleList([
             nn.Linear(2 * d, self.K) for _ in range(n_event_types)
@@ -502,7 +571,7 @@ class SurvivalHead(nn.Module):
         trunk = self.shared(d_ij)  # [2d]
 
         # Per-bin hazard: probability of event in bin k, given survival to bin k
-        logits = self.hazard_heads[event_type](trunk)     # [K]
+        logits = self.hazard_heads[event_type](self.hazard_dropout(trunk))  # [K]
         hazard = torch.sigmoid(logits)                    # [K], each in (0, 1)
 
         # Survival function: probability of no event up to end of bin k
@@ -544,104 +613,17 @@ class SurvivalHead(nn.Module):
         return cdf[-1].item()  # beyond last bin
 ```
 
-### 6.3 Hawkes Self-Excitation
+### 6.3 Design Note: Temporal Clustering Without Hawkes Excitation
 
-Past events between a dyad increase the near-term hazard (events beget events). The Hawkes excitation term modulates the survival head's base hazard:
+The architecture does not include a separate Hawkes self-excitation component. Instead, temporal clustering ("events beget events") is captured through the actor memory mechanism:
 
-```python
-class HawkesExcitation(nn.Module):
-    """
-    Self-excitation component: recent events between a dyad temporarily
-    increase the hazard rate.
+- When a FIGHT event occurs, the GRU (Layer 3) updates both actors' memories, shifting them toward conflict-associated regions of the embedding space.
+- The updated memories produce elevated hazard logits in the near-term bins, naturally reflecting higher short-term risk after recent activity.
+- Cross-type excitation (e.g., THREATEN → FIGHT escalation) is captured through the same mechanism: a THREATEN event shifts actor states in a direction that increases FIGHT hazard.
 
-    The excitation is added to the hazard logits before the sigmoid,
-    so it shifts the survival curve without breaking its monotonicity.
-    """
-    def __init__(self, n_event_types: int = 18):
-        # Per event-type excitation strength and decay rate
-        self.alpha = nn.Parameter(torch.ones(n_event_types, n_event_types) * 0.1)
-        # alpha[r_past, r_predict]: how much a past event of type r_past
-        # excites the hazard for predicting type r_predict
-        self.beta = nn.Parameter(torch.ones(n_event_types) * 0.05)  # decay rate per type
+This approach avoids the need to maintain per-dyad event histories at prediction time and keeps the prediction head stateless (dependent only on current actor memories). If empirical evaluation shows poor calibration on bursty event types, a Hawkes excitation term can be re-introduced as an additive component on hazard logits.
 
-    def forward(self, event_history: list[tuple], r_predict: int, t0: float, bin_midpoints: Tensor) -> Tensor:
-        """
-        Compute excitation contribution to each time bin's hazard.
-
-        event_history: list of (event_time, event_type) for this dyad
-        r_predict: event type being predicted
-        t0: reference time
-        bin_midpoints: [K] midpoint of each time bin in days from t0
-
-        Returns: [K] excitation values to add to hazard logits
-        """
-        excitation = torch.zeros(len(bin_midpoints))
-
-        for t_k, r_k in event_history:
-            dt = t0 - t_k  # how long ago was this event (days)
-            if dt > 0:
-                # Excitation decays into the future from each past event
-                future_decay = torch.exp(-self.beta[r_k] * (bin_midpoints + dt))
-                excitation += self.alpha[r_k, r_predict] * future_decay
-
-        return excitation  # [K], added to hazard logits
-```
-
-**Integration with the survival head:** The excitation is added to the raw hazard logits *before* the sigmoid, so the full forward pass is:
-
-```python
-# In the combined forward pass:
-logits = hazard_heads[event_type](trunk)                        # base hazard logits [K]
-excitation = hawkes.forward(event_history, event_type, t0, bin_midpoints)  # [K]
-hazard = torch.sigmoid(logits + excitation)                     # modulated hazard [K]
-survival = torch.cumprod(1 - hazard, dim=-1)                   # survival curve
-cdf = 1 - survival                                              # CDF
-```
-
-This means:
-- With no recent event history, the model outputs its "base" survival curve from actor states alone.
-- After a conflict event, the near-term hazard bins spike (self-excitation), pulling the survival curve down faster — reflecting that conflict tends to cluster.
-- The excitation decays over time, so the far-term bins are less affected.
-- Cross-type excitation is possible: a THREATEN event can excite FIGHT hazard (escalation dynamics).
-
-### 6.4 Intensity Output (High-Frequency Events)
-
-For event types modeled as rates rather than time-to-event (CONSULT, ENGAGE, COOP, DISAPPROVE), the Hawkes intensity function is the primary output:
-
-```python
-class IntensityHead(nn.Module):
-    """
-    For high-frequency event types: predict the event rate as a continuous
-    function of time, rather than time-to-first-event.
-    """
-    def __init__(self, d: int):
-        self.base_rate_mlp = nn.Sequential(
-            nn.Linear(2 * d, d),
-            nn.ReLU(),
-            nn.Linear(d, 1),
-            nn.Softplus(),  # ensure positive rate
-        )
-
-    def forward(self, h_i: Tensor, h_j: Tensor, event_history: list[tuple],
-                r: int, t0: float, t_query: Tensor) -> Tensor:
-        """
-        Returns: event intensity (rate) at each query time.
-        """
-        # Base rate from actor states
-        mu = self.base_rate_mlp(torch.cat([h_i, h_j]))  # scalar, events/day
-
-        # Self-excitation from past events (same as HawkesExcitation but continuous)
-        excitation = torch.zeros_like(t_query)
-        for t_k, r_k in event_history:
-            dt = t0 + t_query - t_k
-            mask = dt > 0
-            excitation[mask] += self.alpha[r_k, r] * torch.exp(-self.beta[r_k] * dt[mask])
-
-        lambda_t = mu + excitation
-        return lambda_t  # [T], intensity at each query time
-```
-
-### 6.5 CPC Prediction Head (Self-Supervised / Auxiliary)
+### 6.4 CPC Prediction Head (Self-Supervised / Auxiliary)
 
 Projects actor memory into a "prediction space" for contrastive predictive coding. Used as a self-supervised objective in Phase 2 and carried over as an auxiliary loss in Phase 3.
 
@@ -679,7 +661,7 @@ class CPCPredictionHead(nn.Module):
 
 **Surprise score at inference:** `1 - cosine_sim(z_pred, z_target)` provides a per-actor, per-day anomaly score. High values mean the actor's actual news diverged from what the memory predicted. This score is concatenated to the dyadic representation (Section 6.1) as an additional feature for the survival head during Phase 3.
 
-### 6.6 Event-Type Prediction Head (Self-Supervised / Auxiliary)
+### 6.5 Event-Type Prediction Head (Self-Supervised / Auxiliary)
 
 Predicts the distribution of PLOVER event types an actor will be involved in during the next 7-day window. Provides an interpretable "surprise" signal.
 
@@ -829,7 +811,7 @@ relation_embeddings.weight.data[:, 1:] = torch.randn(18, d - 1) * 0.01
 
 | Component | Parameters | Notes |
 |-----------|------------|-------|
-| ConfliBERT encoder | 110M | Fine-tuned during Phase 2–3 |
+| ConfliBERT encoder (frozen) | 110M | Base weights frozen; LoRA adapters (~0.6M) trained during Phase 2–3 |
 | Cross-attention (W_Q, W_K, W_V, W_cond) | ~2.4M | At d_k = d_v = 256 |
 | Memory update MLP | ~0.8M | 2-layer, d × 4d × d |
 | Scalar + dimensional gates | ~0.2M | |
@@ -837,16 +819,14 @@ relation_embeddings.weight.data[:, 1:] = torch.randn(18, d - 1) * 0.01
 | Actor self-attention (2 layers) | ~1.6M | 2 × (MHA + FFN + LayerNorm) |
 | Survival head (shared trunk) | ~2.1M | 6d → 4d → 2d |
 | Per-event-type hazard heads (18) | ~156K | 18 × (2d → 17 bins) |
-| Hawkes excitation | ~7K | 18×18 cross-excitation + 18 decay rates |
-| Intensity head (high-freq types) | ~0.2M | Base rate MLP for rate-based types |
 | CPC prediction head | ~0.5M | W_pred (d→d→d_cpc) + W_target (768→d→d_cpc) |
 | Event-type prediction head | ~0.1M | MLP (d→d→18) |
 | Relation embeddings | ~5K | 18 × d |
 | Baseline projections (W_struct, W_text) | ~0.2M | Shared projections for computing h_baseline_init_i |
 | `alpha_baseline` | 1 | EMA baseline decay rate (shared scalar) |
 | Time2Vec (2 instances) | ~64 | Tiny |
-| **Total (excluding encoder)** | **~10M** | |
-| **Total (including encoder)** | **~120M** | |
+| **Total (excluding encoder)** | **~9.8M** | |
+| **Total (including encoder)** | **~120M** | Encoder adapted via LoRA (~0.6M trainable) |
 
 At d=256 and N_actors=500. Scales roughly as d² for most components.
 
@@ -895,15 +875,14 @@ All transformation weights are shared across actors. When the model applies `W_Q
 
 | Component | Parameters | In Optimizer? |
 |-----------|-----------|---------------|
-| ConfliBERT encoder | All 110M BERT weights | Yes (lr=1e-5) |
+| ConfliBERT encoder (base) | 110M BERT weights | **No** (frozen) |
+| ConfliBERT LoRA adapters | ~0.6M (rank-8 on Q/V, 12 layers) | Yes (lr=1e-4) |
 | Cross-attention projections | W_Q (d × d_k), W_K (768 × d_k), W_V (768 × d_v) | Yes |
 | Name encoding projection | W_name (768 × d), b_name, W_gate (2d × d) | Yes |
 | Memory update gate/MLP | W_proj, W_scalar, W_dims, MLP_update | Yes |
 | GRU cells | GRU_source, GRU_target (all internal weights) | Yes |
 | Actor self-attention layers | MHA projections, FFN weights, LayerNorm (2 layers) | Yes |
 | Survival head | Shared trunk MLP, 18 per-type hazard heads | Yes |
-| Hawkes excitation | alpha (18×18), beta (18) | Yes |
-| Intensity head | Base rate MLP | Yes |
 | Relation embeddings | Embedding(18, d) | Yes |
 | Time2Vec | 2 instances, all frequency/phase parameters | Yes |
 | `lambda_decay` | Scalar (shared) or per-type (18 values) | Yes |

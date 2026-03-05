@@ -36,9 +36,8 @@ Every tensor in the forward pass, traced from raw input through to prediction ou
 | `update_input` | `[d + d_v + time_dim]` | Concatenation of current state, reading, and time | `cat(h_i, m_i, time2vec(t))` | Gates and MLP |
 | `gate_scalar` | scalar | Should this article update actor i at all? | `sparsemax(W_scalar @ update_input)` | Scales delta_h |
 | `gate_dims` | `[d]` | Which memory dimensions should update? | `sigmoid(W_dims @ update_input)` | Element-wise mask on delta_h |
-| `delta_h` | `[d]` | Candidate memory update | `MLP_update(update_input) * gate_scalar` | Added to decayed memory |
-| `h_decayed` | `[d]` | Memory after temporal decay toward baseline | `b_i + exp(-λ*dt) * (h_i - b_i)` | Base for gated update |
-| `h_new` | `[d]` | Updated actor memory | `h_decayed + gate_dims * delta_h` | Replaces h_i |
+| `delta_h` | `[d]` | Candidate memory update | `MLP_update(update_input) * gate_scalar` | Added to current memory |
+| `h_new` | `[d]` | Updated actor memory | `h_i + gate_dims * (actor_weights[i] * delta_h)` | Replaces h_i |
 
 ### Layer 3: Structured Event Stream
 
@@ -80,8 +79,7 @@ Every tensor in the forward pass, traced from raw input through to prediction ou
 | `d_ij` | `[6d + 4]` | Full dyadic representation | Concatenation of above | Survival head shared trunk |
 | `trunk` | `[2d]` | Compressed dyadic features | `shared_MLP(d_ij)`: (6d+4) → 4d → 2d | Per-type hazard heads |
 | `logits` | `[K=17]` | Raw hazard logits per time bin | `hazard_heads[r](trunk)` | Sigmoid → hazard |
-| `excitation` | `[K=17]` | Hawkes self-excitation contribution | HawkesExcitation from event history | Added to logits |
-| `hazard` | `[K=17]` | Per-bin conditional hazard P(event in bin k \| survived to k) | `sigmoid(logits + excitation)` | Survival computation |
+| `hazard` | `[K=17]` | Per-bin conditional hazard P(event in bin k \| survived to k) | `sigmoid(logits)` | Survival computation |
 | `survival` | `[K=17]` | Survival function S(τ) per bin | `cumprod(1 - hazard)` | CDF derivation |
 | `cdf` | `[K=17]` | Cumulative event probability F(τ) per bin | `1 - survival` | Fixed-horizon lookups, loss |
 | `pdf` | `[K=17]` | Probability mass per bin | `hazard * survival_shifted` | DeepHit NLL loss |
@@ -97,14 +95,6 @@ Every tensor in the forward pass, traced from raw input through to prediction ou
 | `article_aggregate` | `[768]` | Mean-pooled ConfliBERT embedding of next-day articles for actor i | `mean_pool(conflibert(articles))` | CPC target encoder |
 | `event_type_logits` | `[18]` | Predicted event-type distribution for next 7-day window | `event_type_predictor(h_i)` | KL divergence loss |
 | `event_type_counts` | `[18]` | Actual PLOVER event counts in next 7-day window | Counted from structured events | KL divergence target |
-
-### Intensity Head (High-Frequency Events)
-
-| Tensor | Shape | Semantic Meaning | Source | Consumed By |
-|--------|-------|-----------------|--------|-------------|
-| `mu` | scalar | Base event rate (events/day) from actor states | `base_rate_mlp(cat(h_i, h_j))` | Intensity function |
-| `excitation` | `[T_query]` | Hawkes self-excitation at each query time | Sum of exp-decayed past events | Added to mu |
-| `lambda_t` | `[T_query]` | Total intensity at each query time | `mu + excitation` | Hawkes NLL loss |
 
 ### Layer 6: Calibration
 
@@ -175,26 +165,11 @@ However, the GRU *replaces* the actor's memory entirely (`h_source_new = GRU_sou
 
 ---
 
-### GAP 4: Temporal Decay Not Applied Before GRU in Event Stream
+### GAP 4: Temporal Decay Not Applied Before GRU in Event Stream — RESOLVED
 
-**Tensors involved:** `h_source [d]` and `h_target [d]` before GRU update in Layer 3
+**Resolution:** Temporal decay is now applied **once per day** during the daily maintenance step (Component 4, Section 5.5), after all articles and events for that day are processed. Neither the text stream nor the event stream applies decay during within-day updates. This eliminates the inconsistency between streams and aligns decay with the natural temporal granularity of the data.
 
-**Issue:** The text stream (Layer 2, Section 3.6) explicitly applies temporal decay before the gated update:
-```
-h_decayed = apply_decay(h_i, b_i, t_last, t, lambda_decay)
-h_new = h_decayed + gate_dims * delta_h
-```
-
-But the event stream (Layer 3, Section 4.3) does not:
-```
-h_source_new = GRU_source(source_input, h_source)  # no decay first
-```
-
-**Risk:** If the text stream processed an article at t=100 and the next event for that actor arrives at t=130, the event stream's GRU sees a memory that's 30 days stale without decay. The memory should have decayed toward baseline during those 30 days. This creates inconsistency: the same actor's memory will look different depending on which stream processes it next.
-
-The training loop in C5 Section 5.3 processes articles first, then events, within each day. So within a day there's no gap. But across days, if an actor has events on day 50 and day 80 with no intervening articles, 30 days of un-decayed memory will feed the GRU.
-
-**Recommendation:** Apply `apply_decay(h_i, b_i, t_last, t_now, lambda_decay)` at the start of every memory update operation, regardless of which stream triggers it.
+Daily maintenance order: (1) temporal decay for all actors, (2) actor self-attention, (3) EMA baseline update.
 
 ---
 
@@ -238,47 +213,19 @@ Within a single TBPTT window, `b_i` is updated K/daily_events_per_actor times (o
 
 ---
 
-### GAP 7: Missing Event History for Hawkes Excitation at Prediction Time
+### GAP 7: Missing Event History for Hawkes Excitation at Prediction Time — RESOLVED
 
-**Tensors involved:** `event_history: list[tuple]` for `HawkesExcitation.forward()`
+**Resolution:** Hawkes excitation has been removed from the architecture entirely. The prediction head is now stateless — it depends only on current actor memories `h_i(t)` and `h_j(t)`, not on per-dyad event histories. Temporal clustering ("events beget events") is captured through the actor memory mechanism: recent events shift actor states via the GRU (Layer 3), causing the hazard logits to naturally reflect elevated short-term risk.
 
-**Issue:** The Hawkes excitation component (Section 6.3) requires `event_history` — a list of `(event_time, event_type)` tuples for the specific dyad being predicted. But the design never specifies how this history is maintained or passed to the prediction head during training.
-
-The training loop (C5 Section 5.3) processes events and articles day by day, updating memories. When `compute_prediction_losses()` is called at TBPTT boundaries, it needs to query the survival head for sampled dyads. Each query requires the dyad's event history — but the training loop doesn't maintain per-dyad event histories.
-
-**Risk:** Implementation will hit this gap immediately. Options:
-1. Maintain a per-dyad event buffer during the rollout (memory cost: O(N_actors^2 * avg_events))
-2. Pre-compute event histories and look them up by (actor_i, actor_j, reference_date)
-3. Approximate with a running summary (last-K events per dyad)
-
-**Recommendation:** Add an explicit `DyadEventHistory` data structure to the training loop that maintains a sliding window of recent events per dyad. The context window definition in C3 Section 4.1 already specifies "dyad_events: last 365 days" — this should be materialized during the rollout.
+This eliminates the per-dyad event history data structure requirement, simplifies the prediction head, and removes ~7K parameters (HawkesExcitation) and ~0.2M parameters (IntensityHead). If empirical evaluation shows poor calibration on bursty event types, Hawkes excitation can be re-introduced as an ablation (see Component 6, Section 8.1).
 
 ---
 
-### GAP 8: TBPTT Window Size vs Daily Processing Granularity
+### GAP 8: TBPTT Window Size vs Daily Processing Granularity — RESOLVED
 
-**Tensors involved:** All memory tensors across K=75 update steps
+**Resolution:** TBPTT K=75 now counts in **simulated days**, not individual articles/events. Within each day, all articles and events build the computation graph (processing is batched per day). The counter increments once per day boundary. K=75 days ≈ 2.5 months of gradient flow, which captures most geopolitical escalation sequences (median crisis escalation: 2–6 weeks) while keeping memory requirements manageable.
 
-**Issue:** The TBPTT window is K=75 "memory update steps." But the training loop counts steps differently for articles and events:
-- Each article processing increments `memory_step_count += 1`
-- Each event processing increments `memory_step_count += 1`
-- Daily self-attention does NOT increment the counter
-
-With ~40K articles/day and ~100K events/day, 75 steps covers a tiny fraction of a single day. This means:
-- Each TBPTT window spans <1 day of simulated time
-- The daily self-attention (Layer 4) might run 0 times within most TBPTT windows (it only runs at day boundaries)
-- Gradients from the prediction loss rarely flow through Layer 4
-
-**Risk:** Layer 4 (actor self-attention) may be severely undertrained. If TBPTT boundaries rarely coincide with Layer 4 execution, the self-attention parameters receive sparse gradient signal.
-
-The design says "run actor self-attention once per simulated day" and "compute losses at TBPTT boundaries." If a single day has 140K update steps (40K articles + 100K events), and K=75, there are ~1,866 TBPTT windows per day, but self-attention only runs once. Only 1 of those 1,866 windows will have Layer 4 in its computation graph.
-
-**Recommendation:** This is a critical issue. Options:
-1. **Batch articles and events per day, not per step.** Count TBPTT in days, not individual update steps. K=75 days is the window.
-2. **Sub-sample articles and events.** Don't process all 40K articles per day — sample a manageable number (e.g., 100–500 most relevant articles per day).
-3. **Decouple Layer 4 gradient from TBPTT.** Run self-attention daily but detach its input from the computation graph, treating Layer 4 as a separate module with its own loss (e.g., the CPC loss computed after self-attention).
-
-Option 2 is likely necessary regardless for compute reasons (40K full ConfliBERT encodings per day per epoch is enormous). Option 1 changes the TBPTT semantics but aligns better with the daily processing rhythm.
+This ensures Layer 4 (actor self-attention) executes ~75 times within each TBPTT window, receiving consistent gradient signal. Intermediate supervision losses are computed every M=15 days within the window. See Component 5 Sections 5.6–5.8 for the updated TBPTT specification.
 
 ---
 
@@ -324,19 +271,14 @@ During training, `is_eligible()` presumably checks the ground-truth event histor
 
 ---
 
-### GAP 11: Inconsistency Between Architecture Doc and Component 4 on Prediction Head
+### GAP 11: Inconsistency Between Architecture Doc and Component 4 on Prediction Head — RESOLVED
 
-**Tensors involved:** `d_ij` composition differs between documents
+**Resolution:** Architecture doc Sections 10.1–10.3 have been updated to match Component 4's survival curve approach:
+- Section 10.1: Dyadic representation now uses `[h_i, h_j, h_i-h_j, |h_i-h_j|, h_i*h_j, e_r, surprise_i, surprise_j]` shape `[6d+4]` — no `time2vec(τ)`.
+- Section 10.2: Replaced binary classifier with SurvivalHead (shared trunk → per-type hazard heads → cumprod → survival curves).
+- Section 10.3: Replaced Hawkes process section with DeepHit survival model specification.
 
-**Issue:** The architecture doc (Section 10.1) includes `time2vec(τ)` (horizon encoding) in the dyadic representation, while Component 4 (Section 6.1) explicitly states "No horizon parameter — the model outputs a full survival curve." The architecture doc also shows `P_event = sigmoid(scores[r])` (binary prediction per type), while Component 4 defines the SurvivalHead with K=17 hazard bins.
-
-These are two fundamentally different prediction architectures:
-1. **Architecture doc:** Per-horizon binary classifier with time2vec(τ) input
-2. **Component 4:** Horizon-free discrete hazard model outputting a full survival curve
-
-**Risk:** If implemented per the architecture doc, you get a separate prediction per horizon (inconsistent across horizons). If implemented per Component 4, the survival curve guarantees monotonicity. Component 4 is clearly the more refined design.
-
-**Recommendation:** Update the architecture doc Sections 10.1–10.4 to match Component 4. The architecture doc appears to be an earlier draft; Component 4 is the authoritative spec.
+Both documents now describe the same architecture: horizon-free discrete hazard model with K=17 bins producing monotonically non-increasing survival curves.
 
 ---
 
@@ -395,40 +337,19 @@ But corrupting the relation type produces a much "easier" negative for most case
 
 ---
 
-### GAP 15: Potential for Overfitting: Per-Event-Type Hazard Heads
+### GAP 15: Potential for Overfitting: Per-Event-Type Hazard Heads — RESOLVED
 
-**Tensors involved:** 18 separate `nn.Linear(2d, K=17)` hazard heads
+**Resolution:** Added `nn.Dropout(0.2)` before each per-type `nn.Linear(2d, K=17)` hazard head in the SurvivalHead (Component 4, Section 6.2). The existing architecture is retained — 18 independent heads with a shared trunk — but dropout regularizes the per-type parameters to reduce overfitting on rare event types.
 
-**Issue:** The survival head has a shared trunk (6d+4 → 4d → 2d, ~2.1M params) followed by 18 separate per-type hazard heads (each 2d → 17, total ~156K params). The shared trunk provides cross-type feature sharing. But the per-type heads are independently parameterized.
-
-For rare event types (FIGHT, SEIZE, SANCTION), the number of positive training examples may be small relative to the per-type head capacity. At d=256, each hazard head has 512*17 + 17 = 8,721 parameters. If a rare event type has <1000 positive examples in the training set, the per-type head is at risk of overfitting.
-
-The curriculum learning (C5 Section 5.5) and event-type weighting (C3 Section 7.2) mitigate this, but they increase the effective gradient magnitude for rare types, which can *accelerate* overfitting rather than prevent it.
-
-**Risk:** Moderate for the rarest event types (SEIZE, potentially FIGHT in certain dyad categories).
-
-**Recommendation:**
-1. Add dropout (0.2–0.3) specifically to the per-type hazard heads
-2. Consider factored hazard heads: instead of 18 independent linear layers, use a shared base + per-type residual: `logits = shared_hazard(trunk) + type_specific_residual[r](trunk)`, where the residual has fewer parameters
-3. Monitor per-type overfitting via train/val loss divergence per event type
+The shared trunk already provides cross-type feature sharing. Dropout on the per-type inputs forces the heads to be robust to missing features, which is particularly valuable for rare types (SEIZE, FIGHT) that have fewer positive examples. Per-type train/val loss divergence should still be monitored (Component 6, Section 8.1 ablation study).
 
 ---
 
-### GAP 16: No Explicit Handling of Media Blackout Periods
+### GAP 16: No Explicit Handling of Media Blackout Periods — DISMISSED
 
-**Tensors involved:** `h_i(t)` decay toward `b_i(t)` when no updates occur
+**Resolution:** Media blackouts generate substantial coverage *about* the blackout itself — internet shutdowns, press freedom violations, and conflict reporting from external sources. This coverage flows through the text stream (Layer 2) and maintains actor memory states reflecting the crisis. The model does not rely solely on coverage *from* the affected region.
 
-**Issue:** The temporal decay mechanism causes memories to decay toward the EMA baseline when no updates occur. This is correct for actors that are genuinely "quiet." But media blackouts (internet shutdowns, conflict zones, censorship) also produce gaps in the data stream — and for the opposite reason.
-
-An actor involved in a major conflict that shuts down media coverage will appear to be "quiet" to the model. Its memory will decay toward the pre-conflict baseline, making it *less* likely to predict ongoing conflict — exactly backwards.
-
-The data quality monitoring (C1 Section 4.1) alerts on volume drops, but there's no mechanism to pause decay or flag an actor as "data-unavailable vs. genuinely quiet."
-
-**Risk:** The model will systematically underpredict conflict persistence for actors in media-blackout situations. This is a known problem in GDELT-based research.
-
-**Recommendation:**
-1. Track per-actor article volume. When an actor's daily article count drops below 20% of its 30-day moving average, flag as "potential blackout" and reduce decay rate (increase effective half-life).
-2. Consider a "data confidence" feature: append the actor's recent article volume (z-scored relative to its own history) to the dyadic representation. This gives the prediction head information about data reliability.
+Additionally, the data quality monitoring system (C1 Section 4.1) already alerts on per-actor volume drops, providing operational awareness. No architectural change required.
 
 ---
 
@@ -511,35 +432,35 @@ This is a fundamental architectural choice, not necessarily a bug. The design ex
 
 ### Critical (will cause training failures or major performance issues)
 
-| # | Gap | Risk |
-|---|-----|------|
-| 8 | TBPTT window size vs daily granularity | Layer 4 receives almost no gradient signal; self-attention will not learn |
-| 4 | No temporal decay before GRU update | Memory staleness in event stream |
-| 7 | Missing event history data structure for Hawkes | Implementation blocker |
-| 10 | State-transition tracking undefined | Cannot train START/END predictions without ground-truth state |
-| 11 | Architecture doc vs Component 4 prediction head inconsistency | Implementation confusion |
+| # | Gap | Status | Risk |
+|---|-----|--------|------|
+| 8 | TBPTT window size vs daily granularity | **RESOLVED** — K counts in days, not items | ~~Layer 4 receives almost no gradient signal~~ |
+| 4 | No temporal decay before GRU update | **RESOLVED** — once-per-day stream-agnostic decay | ~~Memory staleness in event stream~~ |
+| 7 | Missing event history data structure for Hawkes | **RESOLVED** — Hawkes removed entirely | ~~Implementation blocker~~ |
+| 10 | State-transition tracking undefined | Open | Cannot train START/END predictions without ground-truth state |
+| 11 | Architecture doc vs Component 4 prediction head inconsistency | **RESOLVED** — arch doc updated to match C4 | ~~Implementation confusion~~ |
 
 ### Important (will degrade performance or cause subtle issues)
 
-| # | Gap | Risk |
-|---|-----|------|
-| 2 | Scalar gate semantics conflict | Sparsemax on scalar is meaningless |
-| 3 | GRU full-replacement without gating | Noisy event stream updates |
-| 6 | EMA baseline gradient flow unspecified | Potential gradient instability |
-| 9 | Surprise feature cold start | Survival head may ignore surprise features |
-| 13 | 512-token truncation losing article content | Systematic information loss |
-| 15 | Per-type hazard heads overfitting on rare events | Poor generalization for rare types |
-| 16 | Media blackout → false decay | Underprediction during crises |
-| 18 | Shared relation embeddings serving two roles | Compromised representations |
-| 19 | Overlapping regularization schemes | Unpredictable effective weights |
-| 20 | No dyad-specific persistent state | Underfitting on bilateral dynamics |
+| # | Gap | Status | Risk |
+|---|-----|--------|------|
+| 2 | Scalar gate semantics conflict | Open | Sparsemax on scalar is meaningless |
+| 3 | GRU full-replacement without gating | Open | Noisy event stream updates |
+| 6 | EMA baseline gradient flow unspecified | Open | Potential gradient instability |
+| 9 | Surprise feature cold start | Open | Survival head may ignore surprise features |
+| 13 | 512-token truncation losing article content | Open | Systematic information loss |
+| 15 | Per-type hazard heads overfitting on rare events | **RESOLVED** — added dropout(0.2) before heads | ~~Poor generalization for rare types~~ |
+| 16 | Media blackout → false decay | **DISMISSED** — coverage *about* blackouts provides signal | ~~Underprediction during crises~~ |
+| 18 | Shared relation embeddings serving two roles | Open | Compromised representations |
+| 19 | Overlapping regularization schemes | Open | Unpredictable effective weights |
+| 20 | No dyad-specific persistent state | Open | Underfitting on bilateral dynamics |
 
 ### Nice-to-Have (minor refinements)
 
-| # | Gap | Risk |
-|---|-----|------|
-| 1 | Cross-attention dimension mismatch | Implementer confusion |
-| 5 | Asymmetric representation for symmetric events | Wasted capacity |
-| 12 | No warmup mask for new actors in self-attention | Transient disruption |
-| 14 | Uniform corruption type distribution | Suboptimal negative difficulty |
-| 17 | Phase 0 vs Phase 3 evaluation alignment | Unfair comparison |
+| # | Gap | Status | Risk |
+|---|-----|--------|------|
+| 1 | Cross-attention dimension mismatch | Open | Implementer confusion |
+| 5 | Asymmetric representation for symmetric events | Open | Wasted capacity |
+| 12 | No warmup mask for new actors in self-attention | Open | Transient disruption |
+| 14 | Uniform corruption type distribution | Open | Suboptimal negative difficulty |
+| 17 | Phase 0 vs Phase 3 evaluation alignment | Open | Unfair comparison |

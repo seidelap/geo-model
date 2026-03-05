@@ -51,9 +51,8 @@ def evaluate(model: FullModel, test_data: TestDataset, calibration_params: dict)
 
         # Predict for all test queries at this reference date
         for query in test_data.queries_at(reference_date):
-            event_history = get_dyad_event_history(query.source, query.target)
             survival_curve = model.predict_survival(
-                query.source, query.target, query.event_type, event_history
+                query.source, query.target, query.event_type
             )
 
             # Apply calibration (per-bin temperature scaling)
@@ -166,31 +165,7 @@ Compute BSS at the 30-day horizon (primary) against three baselines:
 2. **No-change baseline:** Predict that whatever happened last month will happen this month.
 3. **Phase 0 LightGBM:** The tabular baseline from Component 5.
 
-### 2.5 Hawkes Intensity Metrics (High-Frequency Event Types)
-
-For event types modeled as rates (CONSULT, ENGAGE, COOP, DISAPPROVE), evaluate the Hawkes process output:
-
-```python
-def hawkes_evaluation(predicted_intensities: list, actual_event_times: list, T_windows: list) -> dict:
-    """
-    Evaluate the Hawkes intensity model on high-frequency event types.
-    """
-    # 1. Log-likelihood ratio vs. homogeneous Poisson baseline
-    ll_model = sum(hawkes_log_likelihood(pred, actual, T) for pred, actual, T in zip(...))
-    ll_poisson = sum(poisson_log_likelihood(mean_rate, actual, T) for ...)
-    ll_ratio = ll_model - ll_poisson
-
-    # 2. Count calibration: predicted vs. actual event counts per window
-    predicted_counts = [integrate_intensity(pred, T) for pred, T in zip(...)]
-    actual_counts = [len(times) for times in actual_event_times]
-    count_mae = mean_absolute_error(predicted_counts, actual_counts)
-
-    # 3. Temporal clustering: does the model correctly predict bursty periods?
-    # Compare predicted intensity peaks with actual event clusters
-    return {"ll_ratio": ll_ratio, "count_mae": count_mae}
-```
-
-### 2.6 Log Loss and PR-AUC (Derived)
+### 2.5 Log Loss and PR-AUC (Derived)
 
 ```python
 def log_loss_at_horizon(predicted_cdfs, actual_times, horizon_days, eps=1e-7):
@@ -582,7 +557,7 @@ For each of the 18 PLOVER event types, report:
 
 | Metric | Value | Comparison |
 |--------|-------|------------|
-| Target type | survival / intensity / both | — |
+| Target type | survival (all types) | — |
 | Base rate at 30d (test set) | % | — |
 | C-index | | ≥ 0.70 target |
 | IBS (integrated Brier) | | vs. Phase 0 |
@@ -594,7 +569,6 @@ For each of the 18 PLOVER event types, report:
 | BSS at 30d vs. Phase 0 (LightGBM) | | positive = neural beats tabular |
 | PR-AUC at 30d | | vs. Phase 0 |
 | ECE at 30d (post-calibration) | | < 0.05 target |
-| Hawkes LL ratio (intensity types) | | vs. homogeneous Poisson |
 | Mean surprise score before event | | higher = model was surprised |
 | Mean predicted vs. Kaplan-Meier | | visual agreement |
 
@@ -633,7 +607,7 @@ Test the contribution of each model component by removing it and measuring perfo
 | No text stream | Remove Layer 2, rely only on structured events | Moderate degradation, especially for events with textual precursors (THREATEN, DEMAND) |
 | No event stream | Remove Layer 3, rely only on text | Moderate degradation, especially for high-frequency event types modeled as intensities |
 | No actor self-attention | Remove Layer 4 (skip daily self-attention) | Small-moderate degradation, mainly for second-order effects between indirectly connected actors |
-| No Hawkes excitation | Remove temporal self-excitation from survival head | Degradation on bursty event types (FIGHT, PROTEST) |
+| Add Hawkes excitation | Re-introduce temporal self-excitation on hazard logits | Potential improvement on bursty event types (FIGHT, PROTEST); removed during design review but can be tested as enhancement |
 | No temporal decay | Set λ_decay=0 (memories never decay) | Memories become stale; late-test performance degrades |
 | No EMA baseline | Fixed baseline (no drift) — decay always toward h_baseline_init | Degradation for actors with sustained shifts (sanctions regimes, alliance changes) |
 | No surprise features | Zero out surprise_i and surprise_j in dyadic representation | Quantifies the marginal value of the CPC and event-type prediction signal |

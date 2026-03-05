@@ -136,8 +136,7 @@ Prediction markets aggregate distributed human knowledge effectively but have st
 │         LAYER 5: EVENT PREDICTION HEAD       │
 │                                              │
 │  Query: P(event_r | actor_i, actor_j, τ)    │
-│  Hawkes process for temporal prediction      │
-│  Survival model for time-to-event           │
+│  Discrete hazard → survival curve output    │
 └──────────────────────┬───────────────────────┘
                        │
                        ▼
@@ -563,83 +562,67 @@ In practice 2 layers is sufficient for capturing the relevant international syst
 
 ### 10.1 Dyadic Representation
 
-For a query “what is the probability of event type `r` between actors `i` and `j` within `τ` days?”:
+For a query “what is the probability of event type `r` between actors `i` and `j`?”:
 
 ```python
-# Construct dyadic feature vector
+# Construct dyadic feature vector [6d + 4]
 d_ij = concat([
-    h_i,                    # source actor state
-    h_j,                    # target actor state
-    h_i * h_j,             # element-wise product: compatibility per dimension
-    h_i - h_j,             # difference: asymmetry per dimension
-    abs(h_i - h_j),        # absolute difference: distance per dimension
-    time2vec(τ),            # forecast horizon encoding
-    e_r,                    # relation type embedding (for multi-task head)
+    h_i,                    # [d]  source actor state
+    h_j,                    # [d]  target actor state
+    h_i * h_j,             # [d]  element-wise product: symmetric compatibility
+    h_i - h_j,             # [d]  difference: asymmetry per dimension
+    abs(h_i - h_j),        # [d]  absolute difference: distance per dimension
+    e_r,                    # [d]  relation type embedding
+    surprise_i,            # [2]  source surprise (CPC score, event-type KL)
+    surprise_j,            # [2]  target surprise (CPC score, event-type KL)
 ])
 ```
 
-The element-wise product `h_i ⊙ h_j` captures symmetric compatibility. The difference `h_i - h_j` captures asymmetry: who is the more militarily capable actor, who is more Western-aligned, who is the economic dominant partner. Including both is critical because geopolitical relationships are neither purely symmetric nor purely differential.
+No horizon parameter — the model outputs a full survival curve from which any fixed-horizon probability is a CDF read-off. The element-wise product `h_i ⊙ h_j` captures symmetric compatibility. The difference `h_i - h_j` captures asymmetry: who is the more militarily capable actor, who is more Western-aligned, who is the economic dominant partner. Including both is critical because geopolitical relationships are neither purely symmetric nor purely differential.
 
-### 10.2 Multi-Task Prediction Head
+### 10.2 Multi-Task Survival Head
 
 ```python
-# One MLP head per event type (multi-task)
-scores = {}
-for r in range(18):
-    scores[r] = MLP_r(d_ij)  # shared trunk, relation-specific head
+# Shared trunk: compress dyadic representation
+trunk = MLP_shared(d_ij)    # (6d+4) → 4d → 2d, with ReLU + dropout
 
-# Event probabilities
-P_event = {r: sigmoid(scores[r]) for r in range(18)}
+# Per-event-type discrete hazard heads
+logits = hazard_heads[r](trunk)         # [K=17] raw hazard logits
+hazard = sigmoid(logits)                # [K=17] per-bin hazard in (0,1)
+survival = cumprod(1 - hazard)          # [K=17] survival function
+cdf = 1 - survival                      # [K=17] cumulative event probability
 
 # Goldstein scale intensity (auxiliary regression task)
-goldstein_pred = MLP_goldstein(d_ij)
+goldstein_pred = MLP_goldstein(trunk)
 
 # Escalation probability (binary: will any conflict-class event occur?)
-P_escalation = sigmoid(MLP_escalation(d_ij))
+P_escalation = sigmoid(MLP_escalation(trunk))
 ```
 
-The multi-task setup shares statistical strength across event types. Rare events (military attacks) benefit from representations learned on common events (verbal cooperation, diplomatic consultations).
+The multi-task setup shares statistical strength across event types through the shared trunk. Rare events (military attacks) benefit from representations learned on common events (verbal cooperation, diplomatic consultations). Survival curve monotonicity is guaranteed by the discrete hazard parameterization.
 
-### 10.3 Hawkes Process for Temporal Prediction
+### 10.3 Survival Model for Time-to-Event Prediction
 
-For predicting *when* rather than just *whether* an event occurs:
-
-```python
-def hawkes_intensity(h_i, h_j, event_history_ij, t):
-    """
-    Conditional intensity function: rate at which event type r occurs
-    between actors i and j at time t, given history.
-    """
-    # Base rate from actor states
-    mu = softplus(MLP_base(concat(h_i, h_j)))
-
-    # Self-excitation: past events increase future rate
-    # with exponential decay
-    excitation = sum(
-        exp(-beta * (t - t_k)) * w_type[r_k]
-        for t_k, r_k in event_history_ij
-        if t_k < t
-    )
-
-    # Total intensity
-    lambda_r = mu + softplus(excitation)
-    return lambda_r
-```
-
-The Hawkes process captures a fundamental empirical regularity in conflict data: events beget events. A military skirmish between two countries raises the short-term probability of further skirmishes. Diplomatic agreements cluster similarly. The exponential decay kernel means this excitation effect fades over time.
-
-### 10.4 Survival Model for Time-to-Event Prediction
-
-For questions like “how many days until the next sanctions event between actors i and j?”, frame as a survival analysis problem using DeepHit (Lee et al., AAAI 2018):
+For questions like “how many days until the next sanctions event between actors i and j?”, frame as a survival analysis problem using DeepHit (Lee et al., AAAI 2018). The model outputs a discrete hazard function over K=17 non-uniform time bins:
 
 ```python
 # Discrete-time hazard model (DeepHit)
-hazard_t = MLP_hazard(concat(d_ij, time2vec(t)))  # hazard at each time step
-survival_t = cumprod(1 - hazard_t)                 # survival function
-event_prob_by_t = 1 - survival_t                   # CDF
+# Dyadic representation: actor states + relation embedding + surprise features
+d_ij = concat(h_i, h_j, h_i * h_j, h_i - h_j, abs(h_i - h_j), e_r, surprise_i, surprise_j)
+
+# Shared trunk processes dyadic representation
+trunk = MLP_shared(d_ij)  # (6d+4) → 4d → 2d
+
+# Per-event-type hazard heads output K bin hazards
+logits = hazard_head_r(trunk)         # [K=17] raw logits
+hazard = sigmoid(logits)              # [K=17] per-bin hazard in (0,1)
+survival = cumprod(1 - hazard)        # [K=17] survival function (monotonically non-increasing)
+cdf = 1 - survival                    # [K=17] cumulative event probability
 ```
 
-DeepHit handles competing risks naturally (coup vs. election vs. revolution), does not require proportional hazards assumptions, and works with censored observations (ongoing peace periods where we observe the actor surviving without conflict but do not know the eventual outcome time).
+All 18 event types use this survival curve formulation — including high-frequency types (CONSULT, ENGAGE, COOP, DISAPPROVE), which naturally learn near-zero short-term survival from data. Temporal clustering (“events beget events”) is captured through the actor memories, which are updated by the GRU (Layer 3) and text stream (Layer 2) when recent events occur. The hazard logits computed from these updated memories naturally reflect elevated short-term risk after recent activity.
+
+DeepHit handles competing risks naturally, does not require proportional hazards assumptions, and works with censored observations. Monotonicity (P(30d) ≥ P(7d)) is guaranteed by construction.
 
 Implementation via the `pycox` library (`github.com/havakv/pycox`).
 
@@ -770,9 +753,15 @@ actor_weights = entmax(relevance_scores, alpha=1.5)
 # Dimensional gate: sigmoid per dimension (independent, no competition)
 gate_dims = sigmoid(W_dims @ update_input)
 
-# Update
+# Within-day updates (no decay — decay is applied once per day)
 delta_h = MLP(update_input)
-h_i = h_i * exp(-lambda * dt) + gate_dims * (actor_weights[i] * delta_h)
+h_i = h_i + gate_dims * (actor_weights[i] * delta_h)
+
+# Daily maintenance (after all articles/events for the day):
+# 1. Temporal decay toward EMA baseline
+h_i = b_i + exp(-lambda * dt) * (h_i - b_i)
+# 2. Actor self-attention (Layer 4)
+# 3. EMA baseline update: b_i = alpha * b_i + (1-alpha) * h_i
 ```
 
 -----
@@ -830,7 +819,7 @@ def get_event_weight(event_type, training_step, total_steps):
 
 The key difficulty in training a dynamical model is that gradients must flow back through many steps of memory updates. Two mitigations:
 
-**Truncated backpropagation through time (TBPTT):** Only backpropagate through the last K memory update steps (K=50–100). This limits gradient path length while still allowing the model to learn from recent history.
+**Truncated backpropagation through time (TBPTT):** Only backpropagate through the last K simulated days (K=50–100, default 75 days ≈ 2.5 months). Within each day, all articles and events build the computation graph; the TBPTT counter increments once per day. This ensures Layer 4 (daily self-attention) is always within the gradient path.
 
 **Auxiliary losses at intermediate timesteps:** Add event prediction losses not just at the final timestep but also at intermediate checkpoints during training rollouts. This creates shorter gradient paths and prevents vanishing gradients.
 
@@ -963,11 +952,10 @@ L_mem_reg = λ_reg · Σᵢ ||h_i||²     # L2 regularization on memory norms
 ### 15.5 Total Loss
 
 ```
-L_total = L_focal
+L_total = L_DeepHit
         + λ₁ · L_goldstein
-        + λ₂ · L_DeepHit
-        + λ₃ · L_mem_reg
-        + λ₄ · L0_gate_penalty
+        + λ₂ · L_mem_reg
+        + λ₃ · L0_gate_penalty
 ```
 
 Tune λ hyperparameters via grid search on held-out validation Brier score.
@@ -1076,7 +1064,7 @@ This is achievable on a hobby budget. The bottleneck is engineering and research
 
 ### 17.3 Model Size Tradeoffs
 
-**ConfliBERT (BERT-base, 12L, 110M params):** Baseline. Good domain adaptation for geopolitical text.
+**ConfliBERT (BERT-base, 12L, 110M params):** Baseline. Good domain adaptation for geopolitical text. Base weights frozen; adapted via LoRA (rank=8 on Q/V projections, ~0.6M trainable params). See Component 4, Section 3.4.1.
 
 **DistilConfliBERT (6L, ~66M params):** ~1.7x faster, minimal accuracy loss. Achievable via knowledge distillation from ConfliBERT using HuggingFace’s distillation toolkit.
 
@@ -1124,9 +1112,9 @@ Add ConfliBERT-based text feature extraction. Implement actor self-attention pro
 
 ### Phase 3: Full Architecture (Months 6–12, single GPU)
 
-Implement TGN-style per-actor memory with gated text updates (Layer 2). Add Neural ODE continuous dynamics via `torchdyn`. Add structured event fast-update stream (Layer 3). Full actor self-attention propagation (Layer 4). Transformer Hawkes Process for temporal event density prediction. Ensemble across model families. Real-time GDELT/POLECAT ingestion pipeline. Benchmarking against Polymarket and ViEWS. Interactive visualization dashboard.
+Implement TGN-style per-actor memory with gated text updates (Layer 2). Add Neural ODE continuous dynamics via `torchdyn`. Add structured event fast-update stream (Layer 3). Full actor self-attention propagation (Layer 4). Discrete hazard survival curves for all 18 event types. Ensemble across model families. Real-time GDELT/POLECAT ingestion pipeline. Benchmarking against Polymarket and ViEWS. Interactive visualization dashboard.
 
-**Expected outcome:** Competitive with or superior to Polymarket on low-salience geopolitical events. Publishable architecture contribution (entity memory + actor self-attention + Hawkes process coupling).
+**Expected outcome:** Competitive with or superior to Polymarket on low-salience geopolitical events. Publishable architecture contribution (entity memory + actor self-attention + survival curve prediction).
 
 -----
 
@@ -1137,7 +1125,6 @@ Implement TGN-style per-actor memory with gated text updates (Layer 2). Add Neur
 |PyTorch Geometric Temporal|`github.com/benedekrozemberczki/pytorch_geometric_temporal`|Reference for dynamic GNN baselines (comparison only) |
 |RE-NET                    |`github.com/INK-USC/RE-Net`                                |Autoregressive temporal KG event prediction          |
 |TComplEx/TNTComplEx       |`github.com/facebookresearch/tkbc`                         |Static+temporal KG embedding baselines               |
-|Transformer Hawkes Process|`github.com/SimiaoZuo/Transformer-Hawkes-Process`          |Neural temporal point process                        |
 |Latent ODE                |`github.com/YuliaRubanova/latent_ode`                      |Continuous-time actor dynamics                       |
 |BPTD                      |`github.com/aschein/bptd`                                  |Bayesian Poisson Tucker decomposition (interpretable)|
 |ConfliBERT                |`github.com/eventdata/ConfliBERT`                          |Domain-adapted BERT for conflict text                |
