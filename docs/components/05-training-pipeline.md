@@ -403,7 +403,7 @@ Weights are tuned on a held-out set of downstream event prediction performance (
 
 ### 4.5 Training Schedule
 
-- **Optimizer:** AdamW, lr=2e-5 for ConfliBERT (standard BERT fine-tuning rate), lr=1e-3 for memory update parameters.
+- **Optimizer:** AdamW, lr=1e-4 for ConfliBERT LoRA adapters, lr=1e-3 for memory update parameters.
 - **Warmup:** Linear warmup over first 10% of steps.
 - **Duration:** 2–5 epochs over the training period text corpus (40K articles/day × ~2,500 training days ≈ 100M articles, but heavily subsampled to ~5M for Phase 2).
 - **Early stopping:** Monitor masked entity prediction accuracy on held-out articles. Stop when it plateaus.
@@ -439,7 +439,7 @@ Phase 2's CPC and event-type prediction objectives carry over into Phase 3 as au
 ```python
 # Phase 3 total loss (per TBPTT window):
 L_phase3 = (
-    L_supervised                            # DeepHit + Hawkes + Goldstein (see Section 7)
+    L_supervised                            # DeepHit + Goldstein (see Section 7)
     + 0.1 * L_cpc                           # carried from Phase 2, downweighted 5x
     + 0.1 * L_event_type_pred               # carried from Phase 2, downweighted 3x
     + L_mem + L_gate                        # regularization (unchanged)
@@ -456,13 +456,11 @@ All parameters are trainable, with different learning rates:
 
 | Component | Learning Rate | Rationale |
 |-----------|--------------|-----------|
-| ConfliBERT encoder | 1e-5 | Small LR: preserve pretraining; just fine-tune |
+| ConfliBERT LoRA adapters | 1e-4 | Moderate LR: LoRA adapters on frozen encoder |
 | Memory update parameters | 5e-4 | Medium: needs to adapt to supervised signal |
 | CPC + event-type prediction heads | 5e-4 | Medium: continuing Phase 2 objectives as auxiliary |
 | Actor self-attention layers | 5e-4 | Medium: new component, learning from scratch |
 | Survival/hazard heads | 1e-3 | Larger: top-level heads, most supervised gradient |
-| Hawkes excitation parameters | 1e-3 | Larger: learning temporal dynamics |
-| Intensity head (high-freq types) | 1e-3 | Larger: learning rate dynamics |
 | Relation embeddings | 5e-4 | Medium: should shift to capture prediction structure |
 
 ### 5.3 Training Loop: Chronological Rollout
@@ -474,22 +472,23 @@ def phase3_epoch(model: FullModel, data: ChronologicalStream, K: int = 75):
     """
     One epoch of Phase 3: chronological rollout over the training period.
 
-    The rollout simulates the passage of time. Each day:
+    K is measured in simulated days (not individual article/event steps).
+    Each day:
       1. Activate/deactivate actors whose lifecycle boundaries fall on this day
-      2. Process all articles for this day (Layer 2)
+      2. Process all articles for this day (Layer 2) — no temporal decay within day
       3. Process all structured events for this day (Layer 3)
-      4. Run actor self-attention (Layer 4)
-      5. At TBPTT boundaries: compute losses, backprop, update parameters
+      4. Daily maintenance: temporal decay, self-attention (Layer 4), EMA baseline update
+      5. CPC + event-type prediction (auxiliary losses)
+      6. At TBPTT boundaries (every K days): compute losses, backprop, update parameters
     """
     # --- Epoch initialization (see Component 4, Section 11) ---
-    # Reset all actor memories to their learned baselines
     for actor in registry.all_actors():
         model.H[actor.actor_id] = model.h_baseline[actor.actor_id].clone()
-        model.t_last[actor.actor_id] = data.start_date
+        model.B[actor.actor_id] = model.h_baseline[actor.actor_id].clone()
+        model.t_last_decay[actor.actor_id] = data.start_date
 
-    # Track which actors are currently active
     active_actors = set()
-    memory_step_count = 0
+    day_count = 0
 
     for day in data.iter_days():  # each day in [train_start, train_end]
 
@@ -509,42 +508,36 @@ def phase3_epoch(model: FullModel, data: ChronologicalStream, K: int = 75):
             for actor_id, weight in relevant_actors:
                 m_i = model.actor_reads_document(model.H[actor_id], T)
                 model.H[actor_id] = model.update_memory_from_text(
-                    model.H[actor_id], m_i, day.date, model.t_last[actor_id]
+                    model.H[actor_id], m_i, day.date
                 )
-                model.t_last[actor_id] = day.date
-            memory_step_count += 1
 
         # --- 3. Process structured events for this day (Layer 3) ---
         for event in day.events:
             if event.source_actor_id in active_actors and event.target_actor_id in active_actors:
                 model.H[event.source_actor_id], model.H[event.target_actor_id] = \
                     model.update_from_event(event)
-                model.t_last[event.source_actor_id] = day.date
-                model.t_last[event.target_actor_id] = day.date
-            memory_step_count += 1
 
-        # --- 4. Actor self-attention (once per day, Layer 4) ---
-        active_H = gather_active(model.H, active_actors)
-        updated_H = model.actor_propagation(active_H)
-        write_back_active(model.H, updated_H, active_actors)
+        # --- 4. Daily maintenance (Component 4, Section 5.5) ---
+        model.daily_maintenance(active_actors, day.date)
+        day_count += 1
 
         # --- 5. CPC + event-type prediction (auxiliary, carried from Phase 2) ---
-        # Computed daily after self-attention, using tomorrow's data as targets
         if day.has_next_day:
             L_cpc = cpc_loss(model.H, day.next_day.article_aggregates, day.date)
             L_event_pred = event_type_prediction_loss(model.H, day.next_day.event_counts)
         else:
             L_cpc = L_event_pred = torch.tensor(0.0)
 
-        # --- 6. TBPTT: compute losses and backprop at boundaries ---
-        if memory_step_count >= K:
+        # --- 6. TBPTT: compute losses and backprop every K days ---
+        if day_count >= K:
             L_supervised = compute_prediction_losses(day, model, active_actors)
             losses = L_supervised + 0.1 * L_cpc + 0.1 * L_event_pred
             losses.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
             model.detach_memories()  # truncate gradient path
-            memory_step_count = 0
+            day_count = 0
 ```
 
 ### 5.4 Actor Lifecycle During Training
@@ -653,43 +646,25 @@ def curriculum_weight(event_type: str, step: int, total_steps: int, warmup_frac:
 
 ### 5.6 Truncated Backpropagation Through Time (TBPTT)
 
-The model processes events and articles chronologically, updating actor memories at each step. Full backpropagation through the entire history is infeasible. Instead, truncate gradients:
+The model processes events and articles chronologically, updating actor memories each day. Full backpropagation through the entire training period (~2500 days) is infeasible. Instead, truncate gradients every K simulated days:
+
+**K is measured in days, not individual article/event steps.** Within each day, all articles and events build the computation graph (the number of per-actor updates varies depending on article relevance). The TBPTT counter increments once per day. At K=75 days (~2.5 months), the gradient path captures most multi-step escalation sequences while keeping VRAM manageable.
 
 ```python
-def train_with_tbptt(data_stream: Iterator, model: FullModel, K: int = 75):
-    """
-    Process K memory update steps, compute loss, backprop, then detach.
-    K=50-100 is typical. Higher K = longer gradient paths = better long-range learning but more memory.
-    """
-    step = 0
-    for item in data_stream:
-        if isinstance(item, NormalizedEvent):
-            model.update_from_event(item)
-        elif isinstance(item, CuratedArticle):
-            model.update_from_text(item)
-
-        step += 1
-
-        if step % K == 0:
-            # Compute prediction losses on recent events
-            losses = compute_prediction_losses(recent_predictions)
-            losses.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-
-            # Detach memory vectors to truncate gradient path
-            model.detach_memories()
+# K=75 days: gradients flow through ~75 daily self-attention passes
+# + all within-day article/event updates for those 75 days.
+# At TBPTT boundaries: compute loss, backprop, detach memories.
 ```
 
 ### 5.7 Auxiliary Losses at Intermediate Timesteps
 
-To create shorter gradient paths and prevent vanishing gradients, add prediction losses not just at the final step but also at intermediate checkpoints:
+To create shorter gradient paths and prevent vanishing gradients, add prediction losses at intermediate checkpoints within each TBPTT window:
 
 ```python
-# Every M steps within each TBPTT window, compute an intermediate prediction loss
-M = K // 5  # e.g., every 15 steps within a 75-step window
+# Every M days within each TBPTT window, compute an intermediate prediction loss
+M = K // 5  # e.g., every 15 days within a 75-day window
 
-if step % M == 0:
+if day_count % M == 0 and day_count > 0:
     intermediate_loss = compute_prediction_losses(sample_predictions)
     intermediate_loss *= 0.3  # lower weight than final loss
     total_loss += intermediate_loss
@@ -697,10 +672,10 @@ if step % M == 0:
 
 ### 5.8 Training Schedule
 
-- **Optimizer:** AdamW with separate parameter groups (different LRs per component, see Section 5.2).
-- **Batch size:** Process events/articles in chronological order. Each TBPTT window of K=75 steps constitutes one "batch."
-- **Total steps:** ~100K TBPTT windows (≈ 7.5M memory update steps covering the training period multiple times).
-- **Learning rate schedule:** Linear warmup (1000 steps) → constant → cosine decay (last 20%).
+- **Optimizer:** AdamW with separate parameter groups (different LRs per component, see Section 5.3).
+- **TBPTT window:** K=75 days. Each window processes all articles/events for those days, constituting one gradient update.
+- **Total steps:** Training period (~2500 days) / K (75 days) × epochs (3-5) ≈ 100-170 gradient updates per epoch.
+- **Learning rate schedule:** Linear warmup (first 10% of updates) → constant → cosine decay (last 20%).
 - **Gradient clipping:** Max norm 1.0 to prevent exploding gradients from long temporal chains.
 - **Early stopping:** Monitor validation concordance index (C-index) and Brier scores derived from the CDF. Stop if no improvement for 10 evaluation epochs.
 
@@ -799,40 +774,7 @@ def deephit_loss(
     return L_nll + eta * L_ranking
 ```
 
-### 7.2 Hawkes NLL (Primary — Intensity-Target Types)
-
-```python
-def hawkes_nll(
-    intensity_head: IntensityHead,
-    h_i: Tensor, h_j: Tensor,
-    event_type: int,
-    event_times: list[float],
-    T_window: float,
-) -> Tensor:
-    """
-    Negative log-likelihood of a Hawkes process over a time window.
-    Used for high-frequency event types modeled as rates.
-
-    event_times: exact event times within the window (days from window start)
-    T_window: length of observation window in days
-    """
-    # Log-likelihood of observed events: sum of log-intensity at each event time
-    if len(event_times) > 0:
-        event_t = torch.tensor(event_times)
-        lambda_at_events = intensity_head(h_i, h_j, event_times, event_type, 0.0, event_t)
-        ll = torch.log(lambda_at_events + 1e-8).sum()
-    else:
-        ll = torch.tensor(0.0)
-
-    # Integral of intensity (compensator) — approximated by trapezoidal rule
-    t_grid = torch.linspace(0, T_window, 200)
-    lambda_grid = intensity_head(h_i, h_j, event_times, event_type, 0.0, t_grid)
-    integral = torch.trapezoid(lambda_grid, t_grid)
-
-    return -(ll - integral)
-```
-
-### 7.3 Auxiliary Losses
+### 7.2 Auxiliary Losses
 
 ```python
 # Goldstein scale regression (for uncensored survival examples)
@@ -845,26 +787,20 @@ L_mem = lambda_mem * (h_i.norm().pow(2) + h_j.norm().pow(2))  # λ_mem = 0.01
 L_gate = lambda_gate * model.get_gate_penalty()  # λ_gate = 0.01
 ```
 
-### 7.4 Total Loss
+### 7.3 Total Loss
 
-The total loss depends on example type:
+All event types use the same loss structure:
 
 ```python
-# For survival-target event types (rare/moderate):
-L_survival_example = (
+# For all event types (survival curve output):
+L_example = (
     L_deephit                            # primary: survival NLL + ranking
     + lambda_1 * L_goldstein             # intensity regression (λ₁ = 0.1)
     + L_mem + L_gate                     # regularization
 )
-
-# For intensity-target event types (high-frequency):
-L_intensity_example = (
-    L_hawkes_nll                         # primary: Hawkes process NLL
-    + L_mem + L_gate                     # regularization
-)
 ```
 
-Both are weighted by `temporal_weight * event_type_weight` before aggregation.
+Each example is weighted by `temporal_weight * event_type_weight` before aggregation.
 
 ---
 
@@ -893,7 +829,7 @@ Note: per-actor `h_baseline_i` vectors and actor memory vectors `h_i(t)` are **n
 ### 8.3 Best Model Selection
 
 After Phase 3 training completes:
-1. Identify the checkpoint with the best **aggregate validation metric**: weighted combination of C-index (survival types) and Hawkes NLL (intensity types), plus Brier score at 30-day horizon derived from the CDF.
+1. Identify the checkpoint with the best **aggregate validation metric**: C-index across all event types plus Brier score at 30-day horizon derived from the CDF.
 2. Load that checkpoint's shared weights and actor baselines.
 3. For validation/test evaluation: run a fresh chronological rollout through the relevant period, starting from baselines. This mirrors production inference.
 4. Pass to Component 6 (Validation & Calibration) for final evaluation on the held-out test set.
