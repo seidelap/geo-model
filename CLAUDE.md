@@ -6,7 +6,8 @@ survival curves over 18 PLOVER event types.
 
 - **Architecture spec:** `docs/architecture-design.md`
 - **Component specs:** `docs/components/01-06` (dependency order in `docs/components/README.md`)
-- **Status:** Pre-implementation (architecture designed, no code yet)
+- **Session tasks:** `docs/SESSION_TASKS.md` (27 sessions, parallelization map)
+- **Status:** Skeleton created, implementation starting at Component 1
 
 ## Architecture at a Glance
 
@@ -68,11 +69,14 @@ Six-layer neural pipeline (details in architecture-design.md Sections 6-11):
 <!-- UPDATE this section as implementation proceeds -->
 
 ```shell
-# Tests — TODO
-# pytest tests/ -x -q
-# pytest tests/ -m "not slow"   # skip GPU/data-heavy tests
+# Install (editable)
+pip install -e ".[dev]"
 
-# Linting — TODO
+# Tests
+python -m pytest tests/ -x -q
+python -m pytest tests/ -m "not slow"   # skip GPU/data-heavy tests
+
+# Linting — TODO (enable once ruff config is tuned)
 # ruff check . && ruff format --check .
 
 # Training — TODO
