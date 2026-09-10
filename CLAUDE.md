@@ -89,6 +89,7 @@ python -m pytest tests/ -m "not slow"   # skip GPU/data-heavy tests
 
 # Side experiment: cross-game correlated-parlay backtest (writes docs/experiments/...)
 python scripts/backtest_parlay.py            # add --refresh to re-download games
+python scripts/backtest_parlay_multisport.py # NBA / NHL / MLB version (docs/experiments/parlay-multisport.md)
 ```
 
 ## Coding Standards
