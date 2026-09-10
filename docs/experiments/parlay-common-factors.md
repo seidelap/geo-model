@@ -238,9 +238,11 @@ Statistics examined in this report: 90 table rows (ICC rows, persistence windows
 
 Largest out-of-sample phi in any pre-registered subset: **+0.0140** [-0.0309, +0.0636] (totals, 2011 kickoff to 35, n = 1769 pairs). Most negative: -0.0366 [-0.0562, -0.0179] (totals, 2018 helmet/RTP emphasis, n = 1766). Break-even is 0.098 in either direction (opposite-sign parlays would exploit a negative correlation).
 
+4 of the 24 out-of-sample phi intervals exclude zero (totals, 2018 helmet/RTP emphasis: -0.0366; spreads (home side), weeks 1-4: -0.0198; spreads (home side), 2020 no fans: -0.0316; spreads (home side): same gameday + kickoff window, 2010-2025: -0.0232). The subsets overlap (early weeks and kickoff windows are subsets of the full window) and single-season intervals rest on 17-18 slates, so these are not independent looks. The largest |phi| is 0.0366 (totals, 2018 helmet/RTP emphasis), 2.7x below break-even.
+
 ## 8. Summary
 
-- Same-week ICC (all seasons): totals -0.0000 [-0.0080, +0.0082], spreads -0.0002 [-0.0085, +0.0087]; permutation p = 0.43 / 0.46. No clustering at the gameday, kickoff-window or season level either.
+- Same-week ICC (all seasons): totals -0.0000 [-0.0080, +0.0082], spreads -0.0002 [-0.0085, +0.0087]; permutation p = 0.43 / 0.46. No slate definition (week, gameday, kickoff window, season) shows significant clustering.
 - Same-week pairs 2010–2025 (29536 pairs in 277 slates, 107 per week): totals phi -0.0016 [-0.0129, +0.0104], same-sign 49.9%; spreads phi -0.0103 [-0.0201, +0.0002], same-sign 49.5%. Break-even is 0.098 / 54.9%. Two-sided parlay ROI -0.0902 (totals) and -0.0980 (spreads), i.e. the full vig.
 - Causal persistence: no window (1, 2, 4, 8 weeks, season-to-date, previous season) predicts the current week's residuals for totals; the largest |t| is 0.47 (totals) and 2.01 (spreads) over 12 windows.
 - Kalman filter: the fitted league-offset model predicts same-week pair correlations of at most 0.0578 (totals) and 0.0127 (spreads) out of sample. Calibration slopes of realized residual product on predicted covariance: 0.07 (se 0.28) and -0.03 (se 1.39) vs. 1 for a calibrated model. Likelihood-ratio tests vs. a no-factor model: LR = 3.31 (totals), 6.25 (spreads), 5 df.

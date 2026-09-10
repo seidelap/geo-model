@@ -59,6 +59,47 @@ from geo_model.parlay.pitcher_kalman import (  # noqa: E402
 
 HURDLE_TEXT = "phi > 0.098 (same-sign rate 54.9%) for a 2-leg -110 parlay"
 
+SUMMARY = """## Summary of findings
+
+Null, and precisely so. Fitted on 2021-2022 by predictive likelihood, the granular filter finds no persistent
+market error at the pitcher or offense level (pitcher 0.10 runs with daily persistence 0.23, i.e. 0.001 over the
+5-day start cadence; offense 0.04 runs with persistence 0.01: the closing line already reflects everything a
+pitcher's or lineup's past run residuals say) and only a small
+defense/bullpen error (0.21 runs, persistence 0.99/day) that adds +0.0001 log-likelihood per run observation
+out of sample, i.e. nothing. With those uncertainties the closed-form correlation between P's next start and
+the anchor opponent's next game is 0.000001 and its Cauchy-Schwarz upper bound over any amount of accumulated
+evidence is 0.0011, against a hurdle of 0.098. Evaluated causally on 2023-2025 (6,462 games, 508 daily slates):
+
+- 11,141 starting-pitcher pairs: realized phi -0.009 (95% CI -0.028 to +0.010), moneyline-parlay correlation
+  edge +0.002 per unit (CI -0.017 to +0.023), same-side rate 49.3% vs 50.0% under independence. The top decile
+  by predicted correlation: phi -0.033 (CI -0.084 to +0.024). The 123 pairs whose legs fall on the same day
+  (the only ones an updating market cannot have re-priced) give phi +0.09 (CI -0.09 to +0.27) - the largest
+  number in this report, and 123 pairs cannot tell +0.09 from zero.
+- 40,388 same-day game pairs: predicted |corr| never above 0.00001. The top decile of predicted correlation
+  has realized phi +0.008 (slate-cluster CI -0.022 to +0.042); the filter-oriented moneyline parlay on all
+  same-day pairs shows a nominal edge of +0.015 (cluster CI +0.002 to +0.029) but the same ranking's top decile
+  shows +0.003 (CI -0.032 to +0.036) and the sign-aligned top-decile phi is -0.005, split +0.026 / -0.038 / -0.006
+  across 2023 / 2024 / 2025 - noise on a ranking whose predicted correlations are 1e-6.
+- Single-bet checks: the filter's predicted means have sd 0.07-0.10 runs; even taken at face value (slope 1.4,
+  p=0.002 for the later-leg check, one of four such checks) a 0.09-run shift is 0.8 points of win probability
+  against a 2.4-point vig.
+- Power (simulations on the real schedule): with a market that updates on every game - fully Bayesian or
+  network-blind, i.e. one that never propagates explaining-away between entities - even errors as large as the
+  game noise itself (3 runs per team per game) leave same-day predicted correlations below 0.01 after the first
+  days of a season, and cross-day pitcher pairs uncorrelated. The one-shared-game formula (0.09 at 3-run errors)
+  is a season-opener bound. A static market that never corrects would instead show within-team residual
+  autocorrelation; the observed values are -0.008 (pitchers, runs allowed) and +0.001 (team offense).
+- NBA back-to-back strata of the 20,495 shared-game pairs: both legs on a back-to-back phi +0.031 (n=1,357,
+  CI -0.029 to +0.081), one leg +0.015 (n=5,764), neither -0.004 (n=13,374), anchor on a back-to-back -0.008
+  (n=7,171); two-sided parlay ROI -6% to -10% everywhere.
+
+Multiple-comparison exposure: about 35 statistics are reported (same-day deciles and totals, five pitcher-pair
+subsets, four moneyline rows, four single-bet checks, five NBA strata with totals), plus one non-reported look at
+the same tables under a placeholder parameterization used while debugging the pipeline (its top-decile same-day
+phi was +0.03, driven by 2023 alone, and it is not the pre-registered fitted analysis). Two nominal p-values
+below 0.05 out of ~35 is what chance produces; none of the effects is within a factor of three of the hurdle.
+"""
+
 
 def md_table(df: pd.DataFrame) -> str:
     cols = list(df.columns)
@@ -383,53 +424,73 @@ def run_mlb(args: argparse.Namespace, cfg: MultiSportConfig, pcfg: ParlayConfig)
 
 
 def power_check(games: pd.DataFrame, fitted: GranularParams, offsets: RunOffsets, args: argparse.Namespace, d: float, pp_all: pd.DataFrame, req: pd.DataFrame, tg: pd.DataFrame) -> list[str]:
-    """Simulate from the generative model on the real schedule with an efficient market."""
-    out = ["### Power check: efficient-market simulation on the real schedule\n"]
+    """Simulate from the generative model on the real schedule under two market models."""
+    out = ["### Power check: simulations on the real schedule\n"]
     out.append(
-        "Synthetic run residuals drawn from the state-space model on the 2021-2025 schedule with the actual starters; the market prices every "
-        "game at the Bayesian posterior mean given all earlier games, so residuals are innovations relative to an efficient closing line. "
-        "The filter is then run with the true parameters (no refit) and evaluated exactly as above on the evaluation seasons. Scenarios: "
-        "(a) the fitted parameters; (b) a large-but-conceivable market error (pitcher 1.0 runs, offense/defense 0.5 runs, persistence 0.995/day); "
-        "(c) errors equal to the game noise (3 runs each), which the closed form says is what the hurdle requires.\n"
+        "Synthetic run residuals drawn from the state-space model on the 2021-2025 schedule with the actual starters, under two markets. "
+        "`efficient`: every game is priced at the Bayesian posterior mean given all earlier games (full covariance), so residuals are "
+        "innovations. `local`: the same market but network-blind — it keeps only the diagonal of its covariance, so it updates a pitcher, "
+        "offense or defense on its own games but never propagates explaining-away between entities; this is the hypothesis under test "
+        "(books price legs as independent). The analysis filter is run with the true parameters (no refit) and evaluated exactly as above "
+        "on the evaluation seasons. Error sizes: (a) fitted; (b) large-but-conceivable (pitcher 1.0 runs, offense/defense 0.5 runs, "
+        "persistence 0.995/day); (c) equal to the game noise (3 runs each), the size the one-shared-game formula needs for the hurdle. "
+        "`top_decile_phi` is the realized phi of the top decile of predicted same-day correlation (slate-cluster bootstrap CI); "
+        "`pitcher_top_phi` the same for the pitcher pairs ranked by predicted correlation.\n"
     )
-    scenarios = {
+    sizes = {
         "fitted": fitted,
         "conceivable (1.0 / 0.5 / 0.5)": GranularParams(1.0, 0.995, 0.5, 0.995, 0.5, 0.995, fitted.obs_std, fitted.obs_corr),
         "hurdle-sized (3 / 3 / 3)": GranularParams(3.0, 0.999, 3.0, 0.999, 3.0, 0.999, fitted.obs_std, fitted.obs_corr),
     }
+    scenarios = [("efficient", k) for k in sizes] + [("local", k) for k in sizes if k != "fitted"]
     rows = []
-    for label, p in scenarios.items():
-        log(f"[power] {label}")
-        sim = simulate_granular(games, p, seed=args.seed, market="efficient")
+    for market, label in scenarios:
+        p = sizes[label]
+        log(f"[power] {market} / {label}")
+        sim = simulate_granular(games, p, seed=args.seed, market=market)
         res = GranularKalman(p, RunOffsets()).run(sim, emit_pairs=True, pair_requests=req, emit_from_season=args.train_end + 1)
         kp = res.pairs
         sl, se, _ = kalman_slope(kp)
         top = kp[kp["pred_corr"] >= kp["pred_corr"].quantile(0.9)]
-        s_top = correlation_summary(top["resid_1"], top["resid_2"], n_boot=100)
+        phi_t, ci_t, _ = cluster_bootstrap_phi(top["resid_1"], top["resid_2"], top["gameday"], n_boot=200)
         pp = orient_pair_predictions(pp_all[pp_all["season"] > args.train_end], res.cross_pairs, sim)
         pp = pp[pp["pred_corr"].notna()]
-        # realized leg residuals must come from the simulation
         gi = sim.set_index("game_id")
         home = gi["home_team"]
         h_res = gi["resid"].reindex(pp["h_next_game_id"]).to_numpy() * np.where(home.reindex(pp["h_next_game_id"]).to_numpy() == pp["team_h"].to_numpy(), 1, -1)
         a_res = gi["resid"].reindex(pp["a_next_game_id"]).to_numpy() * np.where(home.reindex(pp["a_next_game_id"]).to_numpy() == pp["team_a"].to_numpy(), 1, -1)
-        s_pp = correlation_summary(h_res, a_res, n_boot=100)
-        top_pp = pp["pred_corr"] >= pp["pred_corr"].quantile(0.9)
-        s_pp_top = correlation_summary(h_res[top_pp.to_numpy()], a_res[top_pp.to_numpy()], n_boot=100)
-        th = theory_pair_corr(p)
+        s_pp = correlation_summary(h_res, a_res, n_boot=200)
+        top_pp = (pp["pred_corr"] >= pp["pred_corr"].quantile(0.9)).to_numpy()
+        s_pp_top = correlation_summary(h_res[top_pp], a_res[top_pp], n_boot=200)
+        tgs = to_team_games(sim)
+        m = tgs["next_resid"].notna()
+        lag1 = np.corrcoef(tgs.loc[m, "resid"], tgs.loc[m, "next_resid"])[0, 1]
         rows.append(
             {
-                "scenario": label, "theory_one_game": th.margin_pitcher, "same_day_pairs": len(kp), "pred_corr_p99": kp["pred_corr"].quantile(0.99),
-                "calib_slope": sl, "slope_se": se, "top_decile_phi": s_top.phi, "top_decile_phi_ci": f"[{s_top.phi_ci[0]:+.3f}, {s_top.phi_ci[1]:+.3f}]",
-                "pitcher_pairs_phi": s_pp.phi, "pitcher_pairs_top_decile_phi": s_pp_top.phi, "pitcher_pred_corr_mean": pp["pred_corr"].mean(),
+                "market": market, "errors": label, "theory_one_game": theory_pair_corr(p).margin_pitcher, "pred_corr_p99": kp["pred_corr"].quantile(0.99),
+                "calib_slope": sl, "slope_se": se, "top_decile_phi": phi_t, "top_decile_phi_ci": f"[{ci_t[0]:+.3f}, {ci_t[1]:+.3f}]",
+                "pitcher_pairs_phi": s_pp.phi, "pitcher_top_phi": s_pp_top.phi, "pitcher_top_phi_ci": f"[{s_pp_top.phi_ci[0]:+.3f}, {s_pp_top.phi_ci[1]:+.3f}]",
+                "lag1_autocorr": lag1,
             }
         )
-    out.append(md_table(pd.DataFrame(rows)) + "\n")
+    tab = pd.DataFrame(rows)
+    out.append(md_table(tab) + "\n")
+    eff = tab[tab["market"] == "efficient"]
+    loc = tab[tab["market"] == "local"]
     out.append(
-        "Reading: with an efficient market the cross-day pitcher pairs carry no correlation whatever the error size (the later leg's closing line "
-        "already reflects the earlier leg), so only same-day pairs can be exploited; the top-decile phi on same-day pairs shows what the filter would "
-        "find if the errors were as large as each scenario assumes. The filter's predicted covariances are calibrated (slope ≈ 1) in every scenario, "
-        "so the near-zero predictions on real data reflect the fitted uncertainties, not a broken pipeline.\n"
+        f"Reading. Efficient market: even hurdle-sized errors leave a 99th-percentile predicted same-day correlation of "
+        f"{eff['pred_corr_p99'].max():.4f} and a top-decile realized phi of at most {eff['top_decile_phi'].max():+.3f}, because a market that "
+        f"updates on every game learns the errors within days; the one-shared-game formula applies only to season openers, and the cross-day "
+        f"pitcher pairs carry no correlation at all (the later closing line already reflects the earlier leg). Network-blind market: the same "
+        f"picture - top-decile same-day phi {loc['top_decile_phi'].iloc[0]:+.3f} / {loc['top_decile_phi'].iloc[-1]:+.3f} and pitcher-pair top-decile "
+        f"phi {loc['pitcher_top_phi'].iloc[0]:+.3f} / {loc['pitcher_top_phi'].iloc[-1]:+.3f} (conceivable / hurdle-sized errors), with 99th-percentile "
+        f"predicted correlations of {loc['pred_corr_p99'].max():.4f}. Each entity's own games remove most of its error whether or not the book "
+        f"propagates information across entities, and the explaining-away covariance left over is second order, so 'books price legs as "
+        f"independent' does not by itself create a bettable correlation. Only a market that never corrects (the static case in "
+        f"`parlay-multisport.md`) leaves a signal, and it appears as within-team residual persistence, which the real data do not show "
+        f"(lag-1 autocorrelation -0.008 for pitchers' runs allowed, +0.001 for team offense). The `fitted` row shows the noise floor of a "
+        f"1,115-pair top decile: phi {tab['pitcher_top_phi'].iloc[0]:+.3f} on predictions that are numerically zero. Calibration slopes are OLS on "
+        f"heavy-tailed residual products with pairs sharing games, so their standard errors are indicative only.\n"
     )
     return out
 
@@ -495,6 +556,7 @@ def main() -> None:
         f"correlations are large enough to beat parlay vig. Hurdle: {HURDLE_TEXT}; break-even phi {be:.3f}.\n"
     )
     out.append("Generated by `python scripts/backtest_pitcher_kalman.py` (see the command at the end).\n")
+    out.append(SUMMARY)
     body: list[str] = []
     stats_all: dict = {}
     mlb_out, mlb_stats = run_mlb(args, cfg, pcfg)
@@ -505,11 +567,32 @@ def main() -> None:
         body.extend(nba_out)
         stats_all.update(nba_stats)
     out.extend(body)
+    out.append("## Caveats\n")
+    out.append(
+        "- Source gaps: the per-book MLB file tags all 2021 Cleveland games and all 2025 Athletics games with gameType `Unknown`, which the "
+        "shared loader drops (about 3% of games); those teams' pairs are missing in those seasons and their entity states are not updated.\n"
+        "- The implied runs split the closing total by a probit-implied margin whose scale is a single constant fitted on all seasons; "
+        "run distributions are skewed (skew about 1) and the filter is Gaussian, so the likelihood fit is a quasi-likelihood.\n"
+        "- Starter identity for a future leg is taken from the box score, i.e. the actual starter, not the probable starter known at the time "
+        "the parlay would be placed; this only affects which entity the prediction uses, never the results.\n"
+        "- Pairs on one slate share games and pitcher pairs share legs; where it matters the CIs resample slates, and the OLS calibration "
+        "slopes are accompanied by within-slate permutation p-values. Cross-pair statistics for the pitcher pairs use pair-level bootstraps.\n"
+        "- The off-season is treated as 30 days of drift; the fit pushed pitcher and offense persistence to negligible values, so this choice "
+        "has no effect on the reported predictions.\n"
+        "- Nelder-Mead with 300 iterations from a fixed start; the likelihood surface is flat near zero variances, so the exact fitted values "
+        "of the collapsed blocks are arbitrary below about 0.1 runs: a second optimizer start (noise std initialised at 3.0 instead of 3.07) "
+        "ended at pitcher 0.02 runs / persistence 0.005 and offense 0.02 / 0.02 with the same defense block, the same likelihood to 0.1 units, "
+        "and the same evaluation tables to the third decimal. The fit takes about 30-40 minutes single-threaded.\n"
+        "- NBA rest days come from the source's `Days_Rest_*` columns (99% agreement with schedule-derived rest); the first game of a season "
+        "carries a placeholder value and is never counted as a back-to-back.\n"
+        "- The optional extra loader (NCAAB/NHL seasons) was not added: the data-hunt report already ran the shared-game pair test on NCAAB "
+        "(51,992 pairs, phi -0.007) and further stratification would only add comparisons.\n"
+    )
     out.append("## Regeneration\n")
     out.append(
         "```\npython scripts/backtest_pitcher_kalman.py --train-end 2022 --max-iter 300 --n-boot 500\n```\n"
-        "About 25 minutes single-threaded (the fit dominates); `--params-json` re-uses saved hyperparameters, `--skip-power` and "
-        "`--skip-nba` drop those sections.\n"
+        "About 50 minutes single-threaded (the Nelder-Mead fit is ~40 of them); `--save-params f.json` stores the fitted hyperparameters "
+        "and `--params-json f.json` re-uses them to regenerate the rest in about 8 minutes; `--skip-power` and `--skip-nba` drop those sections.\n"
     )
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text("\n".join(out))

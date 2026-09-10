@@ -197,6 +197,26 @@ def test_static_market_shows_persistence_not_pair_correlation() -> None:
         simulate_granular(sched, p, market="bogus")
 
 
+def test_local_market_is_between_efficient_and_static() -> None:
+    sched = make_mlb_schedule(n_teams=10, n_days=60, n_seasons=3, seed=6)
+    p = GranularParams(2.0, 0.999, 1.5, 0.999, 1.0, 0.999, 2.0, 0.0)
+    loc = simulate_granular(sched, p, seed=2, market="local")
+    eff = simulate_granular(sched, p, seed=2, market="efficient")
+    sta = simulate_granular(sched, p, seed=2, market="static")
+    assert np.allclose(loc["home_run_resid"] - loc["away_run_resid"], loc["resid"])
+
+    def lag1(sim: pd.DataFrame) -> float:
+        tg = to_team_games(sim)
+        m = tg["next_resid"].notna()
+        return float(np.corrcoef(tg.loc[m, "resid"], tg.loc[m, "next_resid"])[0, 1])
+
+    # A network-blind market still corrects each entity on its own games, so residual persistence is
+    # far below the static market's; the Bayesian market is the most accurate (smallest residual variance).
+    assert lag1(sta) > 0.05 and abs(lag1(loc)) < 0.5 * lag1(sta)
+    assert eff["resid"].var() <= loc["resid"].var() + 0.05 * eff["resid"].var()
+    assert loc["resid"].var() < sta["resid"].var()
+
+
 @pytest.mark.slow
 def test_fit_recovers_large_pitcher_error() -> None:
     sched = make_mlb_schedule(n_teams=10, n_days=90, n_seasons=2, seed=7)

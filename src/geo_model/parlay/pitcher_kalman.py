@@ -504,13 +504,17 @@ def simulate_granular(
         market: ``"efficient"`` prices each game at the Bayesian posterior mean
             given all earlier games (a Kalman filter with the true parameters),
             so residuals are innovations relative to a market that updates on
-            every game; ``"static"`` never updates.
+            every game; ``"local"`` is the same market but blind to the network:
+            it keeps only the diagonal of its covariance, so it updates every
+            entity on its own games and never propagates explaining-away
+            (the hypothesis under test); ``"static"`` never updates.
+        max_gap_days: Cap on the calendar gap used for state propagation.
 
     Returns:
         Copy of ``games`` (rows with a missing starter dropped) with synthetic
         ``home_score, away_score, result, total, resid, tresid``.
     """
-    if market not in {"efficient", "static"}:
+    if market not in {"efficient", "static", "local"}:
         raise ValueError(f"unknown market mode {market!r}")
     rng = np.random.default_rng(seed)
     g = _prepare(games)
@@ -538,7 +542,7 @@ def simulate_granular(
         H = np.vstack([ent.game_rows(ht, at, hs, as_) for ht, at, hs, as_ in zip(sg["home_team"], sg["away_team"], sg["home_qb_id"], sg["away_qb_id"])])
         noise = (rng.normal(size=(G, 2)) @ Lr.T).reshape(-1)
         y = H @ x + noise
-        if market == "efficient":
+        if market in {"efficient", "local"}:
             PHt = P @ H.T
             S = H @ PHt + np.kron(np.eye(G), r_block)
             mu = H @ m
@@ -546,6 +550,8 @@ def simulate_granular(
             m = m + K @ (y - mu)
             P = P - K @ PHt.T
             P = 0.5 * (P + P.T)
+            if market == "local":
+                P = np.diag(np.diag(P))
             y = y - mu
         rh[sg.index] = y[0::2]
         ra[sg.index] = y[1::2]
