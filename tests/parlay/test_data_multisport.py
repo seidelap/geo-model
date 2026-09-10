@@ -147,3 +147,45 @@ def test_load_mlb_archive_repaired_shifts_rows(tmp_path, monkeypatch) -> None:
     assert g.loc["CHC", "total_line"] == 8.0
     assert g.loc["NYM", "home_team"] == "MIL" and g.loc["NYM", "home_score"] == 4
     assert (out["spread_source"] == "moneyline_probit").all()
+
+
+def test_resign_nba_spreads_drops_even_moneyline_rows_and_records_counts() -> None:
+    df = _nba_frame(signed=False)
+    df.loc[[0, 1], ["home_moneyline", "away_moneyline"]] = -110.0  # even price: sign unrecoverable
+    df.loc[[0, 1], "spread_line"] = 1.5
+    out = _resign_nba_spreads(df)
+    assert len(out) == len(df) - 2
+    assert out.attrs["nba_rows_dropped_even_ml"] == 2
+    assert out.attrs["nba_rows_in"] == len(df)
+    assert (out["spread_line"][out["spread_resigned"]] != 0).all() or (df["spread_line"] == 0).any()
+
+
+def test_nba_numeric_parses_plus_signs_and_nbsp() -> None:
+    from geo_model.parlay.data_multisport import _nba_numeric
+
+    s = _nba_numeric(pd.Series(["+145\xa0", " -110", "PK", "0", None, 7.5]))
+    assert s.tolist()[:2] == [145.0, -110.0]
+    assert np.isnan(s.iloc[2]) and s.iloc[3] == 0.0 and np.isnan(s.iloc[4]) and s.iloc[5] == 7.5
+
+
+def test_load_sbr_archive_redates_pre_october_games(tmp_path) -> None:
+    import json
+
+    from geo_model.parlay import data_multisport as dm
+
+    rows = [
+        {"season": 2019, "date": 20191005.0, "home_team": "Bruins", "away_team": "Flyers", "home_final": 3, "away_final": 1,
+         "home_close_ml": -130, "away_close_ml": 110, "close_over_under": 5.5},
+        {"season": 2019, "date": 20190803.0, "home_team": "Flyers", "away_team": "Bruins", "home_final": 2, "away_final": 4,
+         "home_close_ml": 120, "away_close_ml": -140, "close_over_under": 5.5},  # really 2020-08-03 (bubble)
+        {"season": 2020, "date": 20200115.0, "home_team": "Bruins", "away_team": "Flyers", "home_final": 1, "away_final": 0,
+         "home_close_ml": -120, "away_close_ml": 100, "close_over_under": 6.0},  # really 2021-01-15
+    ]
+    d = tmp_path / "multisport"
+    d.mkdir()
+    (d / "nhl_archive_10Y.json").write_text(json.dumps(rows))
+    out = dm.load_sbr_archive("nhl", dm.MultiSportConfig(data_dir=d, margin_sd={"nhl": 2.0}))
+    assert out.attrs["archive_rows_redated"] == 2
+    got = dict(zip(out["season"].astype(int).astype(str) + "_" + out["home_team"], out["gameday"].dt.strftime("%Y-%m-%d")))
+    assert got == {"2019_Bruins": "2019-10-05", "2019_Flyers": "2020-08-03", "2020_Bruins": "2021-01-15"}
+    assert out.sort_values("gameday")["week"].tolist() == [1, 44, 1]

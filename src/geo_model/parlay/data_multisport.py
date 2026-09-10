@@ -123,6 +123,7 @@ def _season_week(gameday: pd.Series, season: pd.Series) -> pd.Series:
 
 def _finish(df: pd.DataFrame, sport: str, config: MultiSportConfig) -> pd.DataFrame:
     """Common tail of every loader: residuals, ids, ordering."""
+    attrs = dict(df.attrs)
     df = df.copy()
     df["gameday"] = pd.to_datetime(df["gameday"], utc=True)
     df = df[df["home_team"] != df["away_team"]]
@@ -158,7 +159,9 @@ def _finish(df: pd.DataFrame, sport: str, config: MultiSportConfig) -> pd.DataFr
     df["resid"] = df["result"] - df["spread_line"]
     df["tresid"] = df["total"] - df["total_line"]
     df = df[df["spread_line"].notna() & df["total_line"].notna()]
-    return df[CLEAN_COLUMNS].reset_index(drop=True)
+    out = df[CLEAN_COLUMNS].reset_index(drop=True)
+    out.attrs.update(attrs)
+    return out
 
 
 def load_nba(config: MultiSportConfig | None = None) -> pd.DataFrame:
@@ -204,10 +207,10 @@ def load_nba(config: MultiSportConfig | None = None) -> pd.DataFrame:
             "away_team": raw["Away"],
             "home_score": (raw["Points"] + raw["Win_Margin"]) / 2.0,
             "away_score": (raw["Points"] - raw["Win_Margin"]) / 2.0,
-            "spread_line": pd.to_numeric(raw["Spread"], errors="coerce"),
-            "total_line": pd.to_numeric(raw["OU"], errors="coerce"),
-            "home_moneyline": pd.to_numeric(raw["ML_Home"], errors="coerce"),
-            "away_moneyline": pd.to_numeric(raw["ML_Away"], errors="coerce"),
+            "spread_line": _nba_numeric(raw["Spread"].replace({"PK": "0", "pk": "0"})),
+            "total_line": _nba_numeric(raw["OU"]),
+            "home_moneyline": _nba_numeric(raw["ML_Home"]),
+            "away_moneyline": _nba_numeric(raw["ML_Away"]),
         }
     )
     out = out.drop_duplicates(subset=["gameday", "home_team", "away_team"])
@@ -215,15 +218,25 @@ def load_nba(config: MultiSportConfig | None = None) -> pd.DataFrame:
     return _finish(out, "nba", config)
 
 
+def _nba_numeric(s: pd.Series) -> pd.Series:
+    """Parse the sqlite odds columns, which mix numbers with strings like ``"+145\\xa0"``."""
+    return pd.to_numeric(s.astype(str).str.replace("\xa0", "", regex=False).str.strip().str.lstrip("+"), errors="coerce")
+
+
 def _resign_nba_spreads(out: pd.DataFrame) -> pd.DataFrame:
     """Restore the sign of unsigned spreads and drop rows inconsistent with the moneyline.
 
     Seasons 2007-08 through 2021-22 of the source store ``|spread|`` only. The
-    sign is recovered from the moneyline favorite. Rows whose (re)signed spread
-    disagrees with the moneyline-implied margin by more than
-    ``NBA_SPREAD_TOLERANCE`` points are dropped (the source has scrambled
-    moneyline columns in a few months, e.g. December 2019), as are
-    (season, month) blocks where more than 20% of rows fail the check.
+    sign is recovered from the moneyline favorite; rows with an even moneyline
+    (``p_home == 0.5``) and a non-zero ``|spread|`` have no recoverable sign and
+    are dropped. Rows whose (re)signed spread disagrees with the
+    moneyline-implied margin by more than ``NBA_SPREAD_TOLERANCE`` points are
+    dropped, as are (season, month) blocks where more than 20% of rows fail the
+    check. On the current file this removes about 1.6% of rows (212 spread /
+    moneyline disagreements, 165 even-moneyline rows, 1 without a moneyline)
+    and no whole month; the counts are stored in ``DataFrame.attrs``
+    (``nba_rows_in``, ``nba_rows_dropped_inconsistent``,
+    ``nba_rows_dropped_even_ml``, ``nba_rows_dropped_no_ml``, ``nba_months_dropped``).
 
     Args:
         out: NBA table before :func:`_finish` with ``spread_line`` and moneylines.
@@ -239,6 +252,7 @@ def _resign_nba_spreads(out: pd.DataFrame) -> pd.DataFrame:
     unsigned = neg_frac < 0.05
     sign = np.sign(p_home - 0.5)
     out["spread_resigned"] = unsigned & has_ml
+    even_ml = out["spread_resigned"] & (sign == 0) & (out["spread_line"].abs() > 0)  # before re-signing zeroes them
     out.loc[out["spread_resigned"], "spread_line"] = out.loc[out["spread_resigned"], "spread_line"].abs() * sign[out["spread_resigned"].to_numpy()]
     z = stats.norm.ppf(np.clip(p_home, 1e-4, 1 - 1e-4))
     signed_rows = (~unsigned) & has_ml & out["spread_line"].notna()
@@ -246,11 +260,21 @@ def _resign_nba_spreads(out: pd.DataFrame) -> pd.DataFrame:
         signed_rows = has_ml & out["spread_line"].notna()  # fall back to the re-signed rows
     scale = float(np.sum(z[signed_rows] * out.loc[signed_rows, "spread_line"]) / np.sum(z[signed_rows] ** 2))
     implied = scale * z
-    bad = has_ml & (np.abs(out["spread_line"] - implied) > NBA_SPREAD_TOLERANCE)
+    bad = has_ml & ~even_ml & (np.abs(out["spread_line"] - implied) > NBA_SPREAD_TOLERANCE)
     month = pd.to_datetime(out["gameday"]).dt.strftime("%Y-%m")
     bad_month = bad.groupby(month).transform("mean") > 0.20
-    keep = ~bad & ~bad_month & has_ml
-    return out[keep].reset_index(drop=True)
+    keep = ~bad & ~bad_month & has_ml & ~even_ml
+    res = out[keep].reset_index(drop=True)
+    res.attrs.update(
+        {
+            "nba_rows_in": int(len(out)),
+            "nba_rows_dropped_inconsistent": int((bad | (bad_month & has_ml & ~even_ml)).sum()),
+            "nba_rows_dropped_even_ml": int(even_ml.sum()),
+            "nba_rows_dropped_no_ml": int((~has_ml).sum()),
+            "nba_months_dropped": sorted(month[bad_month & ~bad].unique().tolist()) if bad_month.any() else [],
+        }
+    )
+    return res
 
 
 def load_sbr_archive(sport: str, config: MultiSportConfig | None = None) -> pd.DataFrame:
@@ -263,7 +287,9 @@ def load_sbr_archive(sport: str, config: MultiSportConfig | None = None) -> pd.D
     Returns:
         Cleaned games table. For NHL/MLB ``spread_line`` is the probit-implied
         margin from the moneyline (``spread_source == "moneyline_probit"``); for
-        NBA the archive's closing spread is used.
+        NBA the archive's closing spread is used. Games the archive dates before
+        October of their season's starting year are moved forward one year (see
+        the inline comment); the count is in ``attrs["archive_rows_redated"]``.
     """
     if sport == "mlb":
         raise ValueError(
@@ -291,6 +317,13 @@ def load_sbr_archive(sport: str, config: MultiSportConfig | None = None) -> pd.D
         out["spread_line"] = -num("home_close_spread")
     out = out[out["gameday"].notna() & out["season"].notna()]
     out["season"] = out["season"].astype(int)
+    # The archive dates some games with the wrong year: NHL 2019-20 bubble playoffs
+    # (Aug-Sep 2020) are dated 2019-08/09 and the Jan-Mar 2021 games of 2020-21 are
+    # dated 2020-01..03. A season that starts in October cannot have games before
+    # October of its own starting year, so shift those dates forward one year.
+    misdated = (out["gameday"].dt.year == out["season"]) & (out["gameday"].dt.month < 10)
+    out.loc[misdated, "gameday"] = out.loc[misdated, "gameday"] + pd.DateOffset(years=1)
+    out.attrs["archive_rows_redated"] = int(misdated.sum())
     return _finish(out, sport, config)
 
 

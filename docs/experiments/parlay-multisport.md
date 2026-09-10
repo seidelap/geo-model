@@ -7,12 +7,26 @@ Hurdle: 2-leg spread/total parlay at -110 needs phi > 0.098 (same-sign rate 54.9
 ## Summary of findings
 
 All-pairs shared-game correlations are indistinguishable from zero in every sport and far below the
-hurdle: NBA -0.001 (20,661 pairs), NHL -0.022 (11,508), MLB 2021-25 +0.022 (3,549), MLB 2011-20 -0.004
+hurdle: NBA -0.002 (20,495 pairs), NHL -0.022 (11,498), MLB 2021-25 +0.022 (3,549), MLB 2011-20 -0.004
 (7,076), Premier League -0.014 (9,413), big-five leagues -0.004 (43,634); NFL was +0.002 (6,488). Totals
 correlations, mechanical two-sided parlays (ROI -8% to -10%, i.e. the vig), the daily-slate Kalman filters
-(predicted |corr| never above 0.003; fitted market-error persistence collapses to ~0 in NHL, MLB and
-soccer, meaning closing lines carry no team-level error that survives to the next day) and the MLB
+(predicted |corr| never above 0.004; the fitted market-error persistence is 0.27 in NHL and collapses to
+~0 in MLB and soccer, and the NBA hyperparameters are unidentified: two optima 0.13 log-likelihood units
+apart, both predicting |corr| below 0.004, so closing lines carry no team-level error that survives to
+the next day) and the MLB
 starting-pitcher pairs (18,549 pairs, phi -0.000, moneyline-parlay edge +0.002) all agree.
+
+What the null result does and does not show. Simulating the explaining-away model on the real NBA
+schedule with a deliberately huge season-start team error (prior_std 10 points, obs_std 12) and a market
+that updates every day gives an all-pairs residual correlation of 0.000 (CI -0.014 to +0.013) and about
++0.03 in weeks 1-2 (MLB 2011-20 schedule, planted 3-run error: all-pairs +0.02, weeks 1-2 phi +0.02, below
+the watch item's out-of-sample +0.07): an efficiently updating market learns a team-level error within days, so the
+one-shared-game formula is an upper bound that applies only to the first games of a season. The
+all-pairs tests therefore cannot separate "no market error" from "large but quickly corrected error";
+what they establish, with CI upper bounds of 0.01-0.04 on phi against a 0.098 hurdle, is that no
+bettable cross-game correlation exists in any sport. The within-team lag-1 residual autocorrelations
+(all between -0.015 and +0.007) rule out the static-market alternative, where an uncorrected error
+would appear as a single-bet edge instead.
 
 One watch item, reported for completeness and not as a finding. MLB team-level pairs in weeks 1-2 of
 the season: in 2021-25 (189 pairs, where it was noticed) residual correlation +0.23 and phi +0.19; in the
@@ -23,89 +37,101 @@ scepticism: the continuous correlation does not replicate, the per-season sign i
 sample, no other sport shows an early-season effect (NFL, NBA, NHL and soccer weeks 1-2 are all within
 noise of zero or negative), the Gaussian theory predicts ~0.0005 for MLB, and this is one of roughly
 sixty subsets examined across sports, so one nominal p~0.03 is what chance produces. Early-season
-favourite calibration (+1.9 points) is too small to explain it. It would take the 2026 and 2027 seasons
-(about 100 qualifying pairs per season) to confirm or kill it.
+favourite calibration (+1.9 points on the legs of those pairs) cannot explain it: shifting favourites up by
+that amount lowers the independence baseline, so the "edge" would grow, not shrink. The composition also
+differs between the two samples (2011-20: the same-side excess is in favourite/underdog mixed pairs;
+2021-25: in both-favourite and both-underdog pairs), which is what noise looks like. At 15-60 qualifying
+pairs per season it would take several more seasons (2026 onward) to confirm or kill it.
 
 Caveats: soccer odds are pre-match snapshots, not closing; the soccer moneyline "edge" is contaminated by
 the favourite-longshot bias in the proportional vig removal (the independence baseline is too
 optimistic for longshot legs), so use the residual correlations and same-side rates there; NBA spreads
-before 2022-23 were re-signed from an unsigned source; NHL goalies are unavailable.
+before 2022-23 were re-signed from an unsigned source (about 1.6% of rows dropped, see the NBA section);
+the NHL archive dated the 2020 bubble playoffs and Jan-Mar 2021 a year early and those dates were
+corrected; NHL goalies are unavailable; the repaired 2011-20 MLB archive cannot recover the last game
+listed on each date (about 8% of games, concentrated on WAS/PHI/PIT/CHC/MIA/NYM/CIN), so for those teams
+"next game" is sometimes the game after next; the moneyline-to-margin scale `sd` and the soccer margin fit
+are single sport-level constants fitted on all seasons (they carry no team or date information, but
+residual signs near zero depend on them); bootstrap CIs resample pairs independently, and cluster
+bootstraps by anchor day, season-week and season give the same intervals to within 0.01.
 
 ## NBA
 
-23336 games, seasons 2007–2025, 20661 shared-game leg pairs. Market sanity: slope of realized margin on the closing spread = 0.980, mean residual -0.115, residual sd 12.48; home win rate 0.580 vs. implied 0.582.
+Source cleaning: 23552 rows; dropped 212 whose (re)signed spread disagrees with the moneyline by more than 6 points, 165 unsigned rows with an even moneyline (sign unrecoverable), 1 without a moneyline; whole months dropped: none. Seasons 2007-08 to 2021-22 store |spread| and were re-signed by moneyline favourite.
+
+23174 games, seasons 2007–2025, 20495 shared-game leg pairs. Market sanity: slope of realized margin on the closing spread = 0.980, mean residual -0.117, residual sd 12.48; home win rate 0.580 vs. implied 0.582.
 
 ### Shared-game pairs: margin residual correlation (prediction: positive)
 
 | subset | n | pearson | pearson_ci | p | spearman | phi | phi_ci | p_both | p_indep |
 |---|---|---|---|---|---|---|---|---|---|
-| all | 20661 | -0.0006 | [-0.015, +0.013] | 0.9360 | 0.0011 | 0.0030 | [-0.010, +0.017] | 0.2501 | 0.2493 |
-| |surprise| [0, 7) | 9034 | 0.0002 | [-0.021, +0.021] | 0.9860 | -0.0026 | -0.0013 | [-0.021, +0.019] | 0.2476 | 0.2479 |
-| |surprise| [14, 1000) | 5258 | -0.0020 | [-0.029, +0.025] | 0.8870 | 0.0030 | -0.0032 | [-0.032, +0.024] | 0.2561 | 0.2569 |
-| |surprise| [7, 14) | 6369 | -0.0009 | [-0.027, +0.024] | 0.9400 | 0.0038 | 0.0139 | [-0.012, +0.040] | 0.2485 | 0.2451 |
-| weeks 1-2 of season | 1825 | -0.0243 | [-0.073, +0.015] | 0.3000 | -0.0251 | 0.0044 | [-0.040, +0.051] | 0.2482 | 0.2471 |
-| weeks 1-3 of season | 2746 | -0.0346 | [-0.070, +0.002] | 0.0700 | -0.0362 | -0.0147 | [-0.052, +0.021] | 0.2441 | 0.2478 |
-| both legs same week | 18223 | -0.0008 | [-0.015, +0.013] | 0.9120 | 0.0019 | 0.0069 | [-0.010, +0.021] | 0.2519 | 0.2501 |
-| out-of-sample seasons | 12791 | -0.0045 | [-0.021, +0.012] | 0.6110 | -0.0035 | 0.0038 | [-0.014, +0.022] | 0.2508 | 0.2498 |
+| all | 20495 | -0.0016 | [-0.016, +0.012] | 0.8180 | 0.0003 | 0.0033 | [-0.010, +0.017] | 0.2501 | 0.2493 |
+| |surprise| [0, 7) | 8972 | -0.0031 | [-0.025, +0.019] | 0.7700 | -0.0064 | -0.0039 | [-0.024, +0.017] | 0.2468 | 0.2478 |
+| |surprise| [14, 1000) | 5221 | -0.0011 | [-0.028, +0.027] | 0.9340 | 0.0052 | -0.0005 | [-0.027, +0.027] | 0.2576 | 0.2578 |
+| |surprise| [7, 14) | 6302 | -0.0005 | [-0.023, +0.024] | 0.9660 | 0.0045 | 0.0167 | [-0.007, +0.041] | 0.2486 | 0.2444 |
+| weeks 1-2 of season | 1813 | -0.0233 | [-0.067, +0.025] | 0.3220 | -0.0240 | 0.0050 | [-0.040, +0.053] | 0.2483 | 0.2470 |
+| weeks 1-3 of season | 2725 | -0.0345 | [-0.070, +0.002] | 0.0720 | -0.0365 | -0.0154 | [-0.052, +0.022] | 0.2435 | 0.2474 |
+| both legs same week | 18029 | -0.0012 | [-0.016, +0.013] | 0.8700 | 0.0015 | 0.0075 | [-0.009, +0.022] | 0.2519 | 0.2501 |
+| out-of-sample seasons | 12686 | -0.0074 | [-0.025, +0.010] | 0.4030 | -0.0068 | 0.0011 | [-0.017, +0.018] | 0.2499 | 0.2497 |
 
 ### Shared-game pairs: total residual correlation (prediction: negative)
 
 | subset | n | pearson | pearson_ci | p | spearman | phi | phi_ci | p_both | p_indep |
 |---|---|---|---|---|---|---|---|---|---|
-| all | 20661 | -0.0055 | [-0.018, +0.013] | 0.4320 | -0.0092 | -0.0108 | [-0.023, +0.003] | 0.2457 | 0.2484 |
-| weeks 1-3 of season | 2746 | -0.0157 | [-0.037, +0.022] | 0.4110 | -0.0145 | -0.0303 | [-0.066, +0.009] | 0.2213 | 0.2288 |
+| all | 20495 | -0.0041 | [-0.016, +0.014] | 0.5580 | -0.0070 | -0.0085 | [-0.021, +0.006] | 0.2463 | 0.2484 |
+| weeks 1-3 of season | 2725 | -0.0154 | [-0.036, +0.022] | 0.4200 | -0.0136 | -0.0286 | [-0.066, +0.008] | 0.2217 | 0.2289 |
 
 ### Mechanical two-sided parlays
 
 | strategy | pairs | roi | same_sign | needed |
 |---|---|---|---|---|
-| spread (cover,cover)+(fail,fail) @-110 | 19967 | -0.0862 | 0.5015 | 0.5488 |
-| totals (over,under)+(under,over) @-110 | 20175 | -0.0790 | 0.4946 | 0.4512 |
+| spread (cover,cover)+(fail,fail) @-110 | 19800 | -0.0858 | 0.5017 | 0.5488 |
+| totals (over,under)+(under,over) @-110 | 20019 | -0.0812 | 0.4958 | 0.4512 |
 
 Moneyline parlays at actual closing prices: (H wins, A wins) + (H loses, A loses), 1 unit each. `corr_edge` = realized ROI minus the ROI expected under independence (vig-free probabilities, actual payouts); a positive edge larger than the vig (about 0.04–0.05 per unit here) would make the parlay +EV.
 
 | subset | pairs | realized_roi | indep_roi | corr_edge | edge_ci | p_same_side | p_same_indep |
 |---|---|---|---|---|---|---|---|
-| all pairs | 20661 | -0.0790 | -0.0733 | -0.0056 | [-0.025, +0.017] | 0.4967 | 0.4997 |
-| weeks 1-2 | 1825 | -0.0726 | -0.0734 | 0.0008 | [-0.064, +0.067] | 0.4953 | 0.5025 |
-| weeks 1-3 | 2746 | -0.1180 | -0.0736 | -0.0444 | [-0.095, +0.005] | 0.4803 | 0.5010 |
-| |surprise| top bin | 6369 | -0.0495 | -0.0734 | 0.0239 | [-0.014, +0.060] | 0.5026 | 0.5021 |
+| all pairs | 20495 | -0.0779 | -0.0730 | -0.0049 | [-0.025, +0.016] | 0.4971 | 0.4996 |
+| weeks 1-2 | 1813 | -0.0729 | -0.0733 | 0.0003 | [-0.061, +0.065] | 0.4937 | 0.5021 |
+| weeks 1-3 | 2725 | -0.1169 | -0.0734 | -0.0435 | [-0.096, +0.011] | 0.4793 | 0.5005 |
+| |surprise| top bin | 6302 | -0.0479 | -0.0728 | 0.0249 | [-0.017, +0.064] | 0.5029 | 0.5020 |
 
 ### Whole-network Kalman filter (daily slates)
 
-Fitted on seasons ≤2013: prior_std=0.310, process_std=0.289, obs_std=11.648, persistence=0.952. One-shared-game theory: latent corr 0.0007, next-game residual corr 0.00000 (break-even 0.098). Out-of-sample 51742 same-day pairs, predicted |corr| max 0.0030, mean 0.00001. Calibration slope of realized residual product on predicted covariance: -489.07 (se 235.91, p=0.038).
+Fitted on seasons ≤2013: prior_std=0.001, process_std=0.373, obs_std=11.645, persistence=0.917. One-shared-game theory: latent corr 0.0000, next-game residual corr 0.00000 (break-even 0.098). Out-of-sample 50978 same-day pairs, predicted |corr| max 0.0037, mean 0.00001. Calibration slope of realized residual product on predicted covariance: -646.34 (se 253.55, p=0.011).
 
 | bin | n | pred_corr_mean | realized_pearson | realized_phi | phi_ci_lo | phi_ci_hi |
 |---|---|---|---|---|---|---|
-| 0 | 10349 | -0.0000 | -0.0012 | -0.0003 | -0.0172 | 0.0182 |
-| 1 | 10348 | -0.0000 | -0.0103 | -0.0140 | -0.0348 | 0.0083 |
-| 2 | 10348 | -0.0000 | -0.0100 | 0.0003 | -0.0197 | 0.0168 |
-| 3 | 10348 | 0.0000 | -0.0163 | -0.0077 | -0.0267 | 0.0103 |
-| 4 | 10349 | 0.0000 | -0.0194 | -0.0089 | -0.0273 | 0.0117 |
+| 0 | 10196 | -0.0000 | 0.0043 | 0.0038 | -0.0150 | 0.0221 |
+| 1 | 10195 | -0.0000 | -0.0076 | -0.0117 | -0.0287 | 0.0105 |
+| 2 | 10196 | -0.0000 | -0.0135 | -0.0051 | -0.0229 | 0.0127 |
+| 3 | 10195 | 0.0000 | -0.0195 | -0.0120 | -0.0334 | 0.0056 |
+| 4 | 10196 | 0.0000 | -0.0214 | -0.0084 | -0.0272 | 0.0117 |
 
-Top decile predicted positive corr: 4985 pairs, same-sign 0.4937, ROI -0.1004. Bottom decile: 5007 pairs, opposite-sign 0.5059, ROI -0.0781.
+Top decile predicted positive corr: 4905 pairs, same-sign 0.4930, ROI -0.1017. Bottom decile: 4935 pairs, opposite-sign 0.4985, ROI -0.0916.
 
-Marginal check: slope of realized residual on Kalman predicted mean 0.02 (se 0.47); within-team lag-1 residual autocorrelation -0.0122 (n=46102).
+Marginal check: slope of realized residual on Kalman predicted mean -0.03 (se 0.63); within-team lag-1 residual autocorrelation -0.0110 (n=45778).
 
 ### Per-season margin-residual correlation (shared-game pairs)
 
 | season | n | pearson |
 |---|---|---|
-| 2007 | 1139 | 0.0384 |
-| 2008 | 1162 | 0.0123 |
-| 2009 | 1169 | 0.0223 |
-| 2010 | 1170 | 0.0263 |
-| 2011 | 925 | -0.0250 |
-| 2012 | 1148 | 0.0005 |
-| 2013 | 1157 | -0.0234 |
-| 2014 | 1165 | -0.0282 |
-| 2015 | 1149 | -0.0047 |
-| 2016 | 1157 | -0.0122 |
-| 2017 | 1176 | 0.0230 |
-| 2018 | 1165 | -0.0223 |
-| 2019 | 1017 | -0.0013 |
-| 2020 | 948 | -0.0382 |
-| 2021 | 1138 | -0.0075 |
+| 2007 | 1119 | 0.0401 |
+| 2008 | 1147 | 0.0227 |
+| 2009 | 1167 | 0.0225 |
+| 2010 | 1165 | 0.0243 |
+| 2011 | 923 | -0.0363 |
+| 2012 | 1141 | 0.0096 |
+| 2013 | 1147 | -0.0151 |
+| 2014 | 1161 | -0.0239 |
+| 2015 | 1137 | -0.0114 |
+| 2016 | 1138 | -0.0213 |
+| 2017 | 1164 | 0.0223 |
+| 2018 | 1155 | -0.0260 |
+| 2019 | 997 | -0.0094 |
+| 2020 | 936 | -0.0407 |
+| 2021 | 1122 | -0.0151 |
 | 2022 | 1126 | 0.0423 |
 | 2023 | 1078 | -0.0075 |
 | 2024 | 1155 | 0.0134 |
@@ -115,58 +141,60 @@ Seasons positive: 42%.
 
 ## NHL
 
-13666 games, seasons 2011–2021, 11508 shared-game leg pairs. Market sanity: slope of realized margin on the moneyline-implied margin = 0.997, mean residual +0.004, residual sd 2.37; home win rate 0.544 vs. implied 0.546.
+Source cleaning: 678 games the archive dated a year early (2019-20 bubble playoffs dated Aug-Sep 2019; Jan-Mar 2021 dated 2020) were moved forward one year so that week 1 and the next-game ordering are chronological. No goalie data.
+
+13666 games, seasons 2011–2021, 11498 shared-game leg pairs. Market sanity: slope of realized margin on the moneyline-implied margin = 0.997, mean residual +0.004, residual sd 2.37; home win rate 0.544 vs. implied 0.546.
 
 ### Shared-game pairs: margin residual correlation (prediction: positive)
 
 | subset | n | pearson | pearson_ci | p | spearman | phi | phi_ci | p_both | p_indep |
 |---|---|---|---|---|---|---|---|---|---|
-| all | 11508 | -0.0218 | [-0.041, -0.003] | 0.0190 | -0.0247 | -0.0090 | [-0.028, +0.011] | 0.2464 | 0.2487 |
-| |surprise| [0, 1) | 2960 | 0.0085 | [-0.030, +0.042] | 0.6460 | 0.0084 | 0.0071 | [-0.026, +0.039] | 0.2514 | 0.2496 |
-| |surprise| [1, 2) | 3614 | -0.0390 | [-0.069, -0.008] | 0.0190 | -0.0478 | -0.0260 | [-0.058, +0.009] | 0.2391 | 0.2456 |
-| |surprise| [2, 1000) | 4934 | -0.0274 | [-0.052, +0.000] | 0.0540 | -0.0278 | -0.0063 | [-0.036, +0.021] | 0.2489 | 0.2505 |
-| weeks 1-2 of season | 809 | -0.0438 | [-0.103, +0.018] | 0.2140 | -0.0499 | -0.0406 | [-0.106, +0.027] | 0.2373 | 0.2475 |
-| weeks 1-3 of season | 1234 | -0.0151 | [-0.070, +0.036] | 0.5970 | -0.0285 | -0.0128 | [-0.069, +0.039] | 0.2431 | 0.2463 |
-| both legs same week | 10120 | -0.0227 | [-0.041, -0.005] | 0.0220 | -0.0259 | -0.0131 | [-0.032, +0.008] | 0.2487 | 0.2520 |
-| out-of-sample seasons | 7416 | -0.0170 | [-0.040, +0.008] | 0.1430 | -0.0193 | -0.0148 | [-0.036, +0.007] | 0.2442 | 0.2479 |
+| all | 11498 | -0.0218 | [-0.041, -0.004] | 0.0200 | -0.0247 | -0.0092 | [-0.027, +0.010] | 0.2466 | 0.2489 |
+| |surprise| [0, 1) | 2958 | 0.0079 | [-0.029, +0.041] | 0.6680 | 0.0078 | 0.0051 | [-0.034, +0.042] | 0.2512 | 0.2499 |
+| |surprise| [1, 2) | 3612 | -0.0388 | [-0.070, -0.007] | 0.0200 | -0.0476 | -0.0260 | [-0.056, +0.009] | 0.2392 | 0.2457 |
+| |surprise| [2, 1000) | 4928 | -0.0271 | [-0.056, +0.001] | 0.0570 | -0.0274 | -0.0055 | [-0.033, +0.024] | 0.2492 | 0.2506 |
+| weeks 1-2 of season | 875 | -0.0348 | [-0.093, +0.026] | 0.3040 | -0.0418 | -0.0371 | [-0.100, +0.024] | 0.2389 | 0.2481 |
+| weeks 1-3 of season | 1340 | -0.0059 | [-0.055, +0.047] | 0.8300 | -0.0204 | -0.0099 | [-0.063, +0.041] | 0.2448 | 0.2473 |
+| both legs same week | 10100 | -0.0225 | [-0.044, -0.003] | 0.0240 | -0.0259 | -0.0143 | [-0.032, +0.003] | 0.2481 | 0.2517 |
+| out-of-sample seasons | 7406 | -0.0170 | [-0.039, +0.004] | 0.1430 | -0.0193 | -0.0151 | [-0.039, +0.006] | 0.2444 | 0.2482 |
 
 ### Shared-game pairs: total residual correlation (prediction: negative)
 
 | subset | n | pearson | pearson_ci | p | spearman | phi | phi_ci | p_both | p_indep |
 |---|---|---|---|---|---|---|---|---|---|
-| all | 11508 | 0.0039 | [-0.015, +0.022] | 0.6740 | 0.0074 | 0.0092 | [-0.011, +0.031] | 0.2492 | 0.2469 |
-| weeks 1-3 of season | 1234 | -0.0380 | [-0.089, +0.020] | 0.1820 | -0.0488 | -0.0401 | [-0.099, +0.019] | 0.2053 | 0.2153 |
+| all | 11498 | 0.0040 | [-0.015, +0.021] | 0.6670 | 0.0075 | 0.0093 | [-0.009, +0.032] | 0.2491 | 0.2468 |
+| weeks 1-3 of season | 1340 | -0.0421 | [-0.096, +0.010] | 0.1240 | -0.0561 | -0.0588 | [-0.113, +0.002] | 0.2054 | 0.2200 |
 
 ### Mechanical two-sided parlays
 
 | strategy | pairs | roi | same_sign | needed |
 |---|---|---|---|---|
-| totals (over,under)+(under,over) @-110 | 9668 | -0.0971 | 0.5046 | 0.4512 |
+| totals (over,under)+(under,over) @-110 | 9661 | -0.0972 | 0.5046 | 0.4512 |
 
 Moneyline parlays at actual closing prices: (H wins, A wins) + (H loses, A loses), 1 unit each. `corr_edge` = realized ROI minus the ROI expected under independence (vig-free probabilities, actual payouts); a positive edge larger than the vig (about 0.04–0.05 per unit here) would make the parlay +EV.
 
 | subset | pairs | realized_roi | indep_roi | corr_edge | edge_ci | p_same_side | p_same_indep |
 |---|---|---|---|---|---|---|---|
-| all pairs | 11508 | -0.0727 | -0.0628 | -0.0099 | [-0.028, +0.009] | 0.4970 | 0.4995 |
-| weeks 1-2 | 809 | -0.1056 | -0.0643 | -0.0413 | [-0.106, +0.021] | 0.4833 | 0.5007 |
-| weeks 1-3 | 1234 | -0.0831 | -0.0644 | -0.0187 | [-0.075, +0.033] | 0.4959 | 0.5000 |
-| |surprise| top bin | 4934 | -0.0786 | -0.0621 | -0.0165 | [-0.043, +0.012] | 0.4970 | 0.4999 |
+| all pairs | 11498 | -0.0730 | -0.0628 | -0.0101 | [-0.030, +0.009] | 0.4969 | 0.4995 |
+| weeks 1-2 | 875 | -0.1027 | -0.0628 | -0.0399 | [-0.103, +0.023] | 0.4846 | 0.5008 |
+| weeks 1-3 | 1340 | -0.0781 | -0.0627 | -0.0154 | [-0.070, +0.039] | 0.4970 | 0.5002 |
+| |surprise| top bin | 4928 | -0.0782 | -0.0621 | -0.0161 | [-0.042, +0.012] | 0.4974 | 0.4999 |
 
 ### Whole-network Kalman filter (daily slates)
 
-Fitted on seasons ≤2014: prior_std=0.410, process_std=0.000, obs_std=2.262, persistence=0.270. One-shared-game theory: latent corr 0.0318, next-game residual corr 0.00095 (break-even 0.098). Out-of-sample 32981 same-day pairs, predicted |corr| max 0.0001, mean 0.00000. Calibration slope of realized residual product on predicted covariance: -4799.42 (se 15376.65, p=0.755).
+Fitted on seasons ≤2014: prior_std=0.410, process_std=0.001, obs_std=2.262, persistence=0.270. One-shared-game theory: latent corr 0.0318, next-game residual corr 0.00095 (break-even 0.098). Out-of-sample 32981 same-day pairs, predicted |corr| max 0.0001, mean 0.00000. Calibration slope of realized residual product on predicted covariance: -4769.27 (se 15494.41, p=0.758).
 
 | bin | n | pred_corr_mean | realized_pearson | realized_phi | phi_ci_lo | phi_ci_hi |
 |---|---|---|---|---|---|---|
-| 0 | 6597 | -0.0000 | 0.0138 | 0.0124 | -0.0112 | 0.0353 |
-| 1 | 6596 | -0.0000 | 0.0057 | 0.0232 | 0.0001 | 0.0479 |
-| 2 | 6596 | -0.0000 | 0.0291 | 0.0152 | -0.0071 | 0.0362 |
-| 3 | 6596 | 0.0000 | 0.0023 | 0.0068 | -0.0185 | 0.0306 |
-| 4 | 6596 | 0.0000 | -0.0020 | -0.0001 | -0.0230 | 0.0257 |
+| 0 | 6597 | -0.0000 | 0.0166 | 0.0187 | -0.0076 | 0.0446 |
+| 1 | 6596 | -0.0000 | 0.0041 | 0.0191 | -0.0031 | 0.0399 |
+| 2 | 6596 | -0.0000 | 0.0252 | 0.0145 | -0.0053 | 0.0364 |
+| 3 | 6596 | 0.0000 | 0.0021 | 0.0044 | -0.0162 | 0.0258 |
+| 4 | 6596 | 0.0000 | 0.0009 | 0.0010 | -0.0190 | 0.0256 |
 
-Top decile predicted positive corr: 3299 pairs, same-sign 0.4923, ROI -0.1029. Bottom decile: 3299 pairs, opposite-sign 0.4759, ROI -0.1328.
+Top decile predicted positive corr: 3299 pairs, same-sign 0.4895, ROI -0.1079. Bottom decile: 3299 pairs, opposite-sign 0.4744, ROI -0.1355.
 
-Marginal check: slope of realized residual on Kalman predicted mean -19.88 (se 22.78); within-team lag-1 residual autocorrelation -0.0144 (n=26990).
+Marginal check: slope of realized residual on Kalman predicted mean -13.00 (se 23.10); within-team lag-1 residual autocorrelation -0.0146 (n=26990).
 
 ### Per-season margin-residual correlation (shared-game pairs)
 
@@ -180,13 +208,15 @@ Marginal check: slope of realized residual on Kalman predicted mean -19.88 (se 2
 | 2016 | 1152 | -0.0125 |
 | 2017 | 1199 | -0.0357 |
 | 2018 | 1213 | -0.0239 |
-| 2019 | 1037 | 0.0009 |
+| 2019 | 1027 | 0.0013 |
 | 2020 | 435 | 0.0666 |
 | 2021 | 1228 | -0.0400 |
 
 Seasons positive: 18%.
 
 ## MLB
+
+Week 1 starts at the season's first game, so seasons with an international opening series (2014, 2019 in the archive, 2024, 2025) have a short week 1-2 window with few pairs.
 
 11130 games, seasons 2021–2025, 3549 shared-game leg pairs. Market sanity: slope of realized margin on the moneyline-implied margin = 1.095, mean residual -0.255, residual sd 4.34; home win rate 0.533 vs. implied 0.533.
 
@@ -227,19 +257,19 @@ Moneyline parlays at actual closing prices: (H wins, A wins) + (H loses, A loses
 
 ### Whole-network Kalman filter (daily slates)
 
-Fitted on seasons ≤2022: prior_std=0.675, process_std=0.000, obs_std=4.303, persistence=0.000. One-shared-game theory: latent corr 0.0240, next-game residual corr 0.00055 (break-even 0.098). Out-of-sample 40460 same-day pairs, predicted |corr| max 0.0000, mean 0.00000. Calibration slope of realized residual product on predicted covariance: 25948216395260860818046736578994241536.00 (se 60136117772788780151343083806531780608.00, p=0.666).
+Fitted on seasons ≤2022: prior_std=0.675, process_std=0.000, obs_std=4.303, persistence=0.000. One-shared-game theory: latent corr 0.0240, next-game residual corr 0.00055 (break-even 0.098). Out-of-sample 40460 same-day pairs, predicted |corr| max 0.0000, mean 0.00000. Calibration slope of realized residual product on predicted covariance: not defined (all predicted covariances are numerically zero).
 
 | bin | n | pred_corr_mean | realized_pearson | realized_phi | phi_ci_lo | phi_ci_hi |
 |---|---|---|---|---|---|---|
-| 0 | 8098 | -0.0000 | -0.0356 | -0.0264 | -0.0497 | -0.0042 |
-| 1 | 8100 | -0.0000 | 0.0090 | 0.0141 | -0.0104 | 0.0336 |
-| 2 | 8079 | -0.0000 | -0.0245 | -0.0127 | -0.0327 | 0.0063 |
-| 3 | 8100 | 0.0000 | 0.0086 | 0.0110 | -0.0107 | 0.0315 |
-| 4 | 8083 | 0.0000 | 0.0199 | 0.0170 | -0.0050 | 0.0377 |
+| 0 | 8127 | -0.0000 | -0.0297 | -0.0129 | -0.0369 | 0.0079 |
+| 1 | 8057 | -0.0000 | 0.0036 | 0.0033 | -0.0213 | 0.0277 |
+| 2 | 8092 | -0.0000 | -0.0163 | -0.0068 | -0.0281 | 0.0121 |
+| 3 | 8093 | 0.0000 | -0.0023 | 0.0010 | -0.0193 | 0.0247 |
+| 4 | 8091 | 0.0000 | 0.0216 | 0.0189 | -0.0018 | 0.0397 |
 
-Top decile predicted positive corr: 4075 pairs, same-sign 0.5166, ROI -0.0587. Bottom decile: 4051 pairs, opposite-sign 0.5199, ROI -0.0526.
+Top decile predicted positive corr: 4082 pairs, same-sign 0.5164, ROI -0.0589. Bottom decile: 4046 pairs, opposite-sign 0.5198, ROI -0.0528. (Deciles are ill-defined here: most predicted correlations are tied at zero.)
 
-Marginal check: slope of realized residual on Kalman predicted mean -987121764.98 (se 4234834973.40); within-team lag-1 residual autocorrelation -0.0042 (n=22112).
+Marginal check: slope of realized residual on Kalman predicted mean not defined (all predicted means are numerically zero); within-team lag-1 residual autocorrelation -0.0042 (n=22112).
 
 ### Starting-pitcher pairs (MLB)
 
@@ -281,6 +311,8 @@ Seasons positive: 60%.
 
 Repaired 10-year SportsBookReview archive (row misalignment fixed by shifting the away-side fields up one row within each date; validated on the 2021 overlap: 97.9% exact score agreement, moneyline correlation 0.96). No starting pitchers. Serves as the out-of-sample check for the 2021-2025 early-season subset.
 
+Week 1 starts at the season's first game, so seasons with an international opening series (2014, 2019 in the archive, 2024, 2025) have a short week 1-2 window with few pairs.
+
 21210 games, seasons 2011–2020, 7076 shared-game leg pairs. Market sanity: slope of realized margin on the moneyline-implied margin = 1.107, mean residual -0.231, residual sd 4.23; home win rate 0.532 vs. implied 0.535.
 
 ### Shared-game pairs: margin residual correlation (prediction: positive)
@@ -320,16 +352,18 @@ Moneyline parlays at actual closing prices: (H wins, A wins) + (H loses, A loses
 
 ### Whole-network Kalman filter (daily slates)
 
-Fitted on seasons ≤2014: prior_std=0.201, process_std=0.000, obs_std=4.066, persistence=0.000. One-shared-game theory: latent corr 0.0024, next-game residual corr 0.00001 (break-even 0.098). Out-of-sample 72618 same-day pairs, predicted |corr| max 0.0000, mean 0.00000. Calibration slope of realized residual product on predicted covariance: -983779070391899727593472.00 (se 440128304302106444038144.00, p=0.025).
+Fitted on seasons ≤2014: prior_std=0.201, process_std=0.000, obs_std=4.066, persistence=0.000. One-shared-game theory: latent corr 0.0024, next-game residual corr 0.00001 (break-even 0.098). Out-of-sample 72618 same-day pairs, predicted |corr| max 0.0000, mean 0.00000. Calibration slope of realized residual product on predicted covariance: not defined (all predicted covariances are numerically zero).
 
 | bin | n | pred_corr_mean | realized_pearson | realized_phi | phi_ci_lo | phi_ci_hi |
 |---|---|---|---|---|---|---|
-| 0 | 68475 | -0.0000 | -0.0050 | 0.0005 | -0.0068 | 0.0078 |
-| 1 | 4143 | 0.0000 | -0.0238 | -0.0008 | -0.0336 | 0.0250 |
+| 0 | 14637 | -0.0000 | -0.0025 | 0.0017 | -0.0135 | 0.0175 |
+| 1 | 42356 | -0.0000 | -0.0083 | -0.0011 | -0.0115 | 0.0077 |
+| 2 | 1151 | 0.0000 | -0.0257 | -0.0152 | -0.0685 | 0.0378 |
+| 3 | 14474 | 0.0000 | -0.0019 | 0.0046 | -0.0114 | 0.0200 |
 
-Top decile predicted positive corr: 68491 pairs, same-sign 0.5008, ROI -0.0875. Bottom decile: 68475 pairs, opposite-sign 0.4997, ROI -0.0893.
+Top decile predicted positive corr: 7277 pairs, same-sign 0.5032, ROI -0.0830. Bottom decile: 7355 pairs, opposite-sign 0.5027, ROI -0.0840. (Deciles are ill-defined here: most predicted correlations are tied at zero.)
 
-Marginal check: slope of realized residual on Kalman predicted mean -20278574067217162617824083139447931953548886016.00 (se 34043373768122699021573291667731403096216043520.00); within-team lag-1 residual autocorrelation +0.0065 (n=42120).
+Marginal check: slope of realized residual on Kalman predicted mean not defined (all predicted means are numerically zero); within-team lag-1 residual autocorrelation +0.0065 (n=42120).
 
 ### Per-season margin-residual correlation (shared-game pairs)
 
@@ -393,19 +427,19 @@ Moneyline parlays at actual closing prices: (H wins, A wins) + (H loses, A loses
 
 ### Whole-network Kalman filter (daily slates)
 
-Fitted on seasons ≤2012: prior_std=0.467, process_std=0.000, obs_std=1.541, persistence=0.000. One-shared-game theory: latent corr 0.0842, next-game residual corr 0.00607 (break-even 0.098). Out-of-sample 10226 same-day pairs, predicted |corr| max 0.0000, mean 0.00000. Calibration slope of realized residual product on predicted covariance: 8511314702099548330371009478656.00 (se 9832258394508326605860376674304.00, p=0.387).
+Fitted on seasons ≤2012: prior_std=0.467, process_std=0.000, obs_std=1.541, persistence=0.000. One-shared-game theory: latent corr 0.0842, next-game residual corr 0.00607 (break-even 0.098). Out-of-sample 10226 same-day pairs, predicted |corr| max 0.0000, mean 0.00000. Calibration slope of realized residual product on predicted covariance: not defined (all predicted covariances are numerically zero).
 
 | bin | n | pred_corr_mean | realized_pearson | realized_phi | phi_ci_lo | phi_ci_hi |
 |---|---|---|---|---|---|---|
 | 0 | 2064 | -0.0000 | 0.0537 | 0.0421 | -0.0010 | 0.0836 |
-| 1 | 2027 | -0.0000 | 0.0116 | 0.0146 | -0.0348 | 0.0666 |
-| 2 | 2046 | -0.0000 | -0.0168 | -0.0206 | -0.0684 | 0.0166 |
-| 3 | 2044 | 0.0000 | 0.0047 | -0.0157 | -0.0586 | 0.0377 |
-| 4 | 2045 | 0.0000 | 0.0054 | -0.0082 | -0.0535 | 0.0358 |
+| 1 | 2028 | -0.0000 | 0.0128 | 0.0150 | -0.0279 | 0.0597 |
+| 2 | 2046 | -0.0000 | -0.0154 | -0.0237 | -0.0627 | 0.0223 |
+| 3 | 2045 | 0.0000 | 0.0030 | -0.0122 | -0.0608 | 0.0310 |
+| 4 | 2043 | 0.0000 | 0.0045 | -0.0092 | -0.0510 | 0.0312 |
 
-Top decile predicted positive corr: 1029 pairs, same-sign 0.4859, ROI -0.1145. Bottom decile: 1039 pairs, opposite-sign 0.4937, ROI -0.1002.
+Top decile predicted positive corr: 1023 pairs, same-sign 0.4878, ROI -0.1111. Bottom decile: 1039 pairs, opposite-sign 0.4937, ROI -0.1002. (Deciles are ill-defined here: most predicted correlations are tied at zero.)
 
-Marginal check: slope of realized residual on Kalman predicted mean -926779503303524.88 (se 388181062745514.50); within-team lag-1 residual autocorrelation -0.0002 (n=18910).
+Marginal check: slope of realized residual on Kalman predicted mean not defined (all predicted means are numerically zero); within-team lag-1 residual autocorrelation -0.0002 (n=18910).
 
 ### Per-season margin-residual correlation (shared-game pairs)
 
@@ -486,16 +520,16 @@ Moneyline parlays at actual closing prices: (H wins, A wins) + (H loses, A loses
 
 ### Whole-network Kalman filter (daily slates)
 
-Fitted on seasons ≤2012: prior_std=0.145, process_std=0.000, obs_std=1.544, persistence=0.000. One-shared-game theory: latent corr 0.0087, next-game residual corr 0.00007 (break-even 0.098). Out-of-sample 193018 same-day pairs, predicted |corr| max 0.0000, mean 0.00000. Calibration slope of realized residual product on predicted covariance: 24680154461502824853291401216.00 (se 17123032637238112458159161344.00, p=0.149).
+Fitted on seasons ≤2012: prior_std=0.145, process_std=0.000, obs_std=1.544, persistence=0.000. One-shared-game theory: latent corr 0.0087, next-game residual corr 0.00007 (break-even 0.098). Out-of-sample 193018 same-day pairs, predicted |corr| max 0.0000, mean 0.00000. Calibration slope of realized residual product on predicted covariance: not defined (all predicted covariances are numerically zero).
 
 | bin | n | pred_corr_mean | realized_pearson | realized_phi | phi_ci_lo | phi_ci_hi |
 |---|---|---|---|---|---|---|
-| 0 | 176343 | -0.0000 | 0.0020 | 0.0030 | -0.0024 | 0.0075 |
-| 1 | 16675 | 0.0000 | 0.0082 | 0.0045 | -0.0128 | 0.0210 |
+| 0 | 176531 | -0.0000 | 0.0019 | 0.0030 | -0.0011 | 0.0076 |
+| 1 | 16487 | 0.0000 | 0.0102 | 0.0047 | -0.0101 | 0.0218 |
 
-Top decile predicted positive corr: 168964 pairs, same-sign 0.5013, ROI -0.0864. Bottom decile: 19374 pairs, opposite-sign 0.4922, ROI -0.1031.
+Top decile predicted positive corr: 169105 pairs, same-sign 0.5014, ROI -0.0863. Bottom decile: 19333 pairs, opposite-sign 0.4924, ROI -0.1027. (Deciles are ill-defined here: most predicted correlations are tied at zero.)
 
-Marginal check: slope of realized residual on Kalman predicted mean -13603636950438.57 (se 18878182360940.02); within-team lag-1 residual autocorrelation -0.0057 (n=87593).
+Marginal check: slope of realized residual on Kalman predicted mean not defined (all predicted means are numerically zero); within-team lag-1 residual autocorrelation -0.0057 (n=87593).
 
 ### Per-season margin-residual correlation (shared-game pairs)
 

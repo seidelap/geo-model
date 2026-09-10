@@ -49,12 +49,26 @@ SPORTS = {
 SUMMARY = """## Summary of findings
 
 All-pairs shared-game correlations are indistinguishable from zero in every sport and far below the
-hurdle: NBA -0.001 (20,661 pairs), NHL -0.022 (11,508), MLB 2021-25 +0.022 (3,549), MLB 2011-20 -0.004
+hurdle: NBA -0.002 (20,495 pairs), NHL -0.022 (11,498), MLB 2021-25 +0.022 (3,549), MLB 2011-20 -0.004
 (7,076), Premier League -0.014 (9,413), big-five leagues -0.004 (43,634); NFL was +0.002 (6,488). Totals
 correlations, mechanical two-sided parlays (ROI -8% to -10%, i.e. the vig), the daily-slate Kalman filters
-(predicted |corr| never above 0.003; fitted market-error persistence collapses to ~0 in NHL, MLB and
-soccer, meaning closing lines carry no team-level error that survives to the next day) and the MLB
+(predicted |corr| never above 0.004; the fitted market-error persistence is 0.27 in NHL and collapses to
+~0 in MLB and soccer, and the NBA hyperparameters are unidentified: two optima 0.13 log-likelihood units
+apart, both predicting |corr| below 0.004, so closing lines carry no team-level error that survives to
+the next day) and the MLB
 starting-pitcher pairs (18,549 pairs, phi -0.000, moneyline-parlay edge +0.002) all agree.
+
+What the null result does and does not show. Simulating the explaining-away model on the real NBA
+schedule with a deliberately huge season-start team error (prior_std 10 points, obs_std 12) and a market
+that updates every day gives an all-pairs residual correlation of 0.000 (CI -0.014 to +0.013) and about
++0.03 in weeks 1-2 (MLB 2011-20 schedule, planted 3-run error: all-pairs +0.02, weeks 1-2 phi +0.02, below
+the watch item's out-of-sample +0.07): an efficiently updating market learns a team-level error within days, so the
+one-shared-game formula is an upper bound that applies only to the first games of a season. The
+all-pairs tests therefore cannot separate "no market error" from "large but quickly corrected error";
+what they establish, with CI upper bounds of 0.01-0.04 on phi against a 0.098 hurdle, is that no
+bettable cross-game correlation exists in any sport. The within-team lag-1 residual autocorrelations
+(all between -0.015 and +0.007) rule out the static-market alternative, where an uncorrected error
+would appear as a single-bet edge instead.
 
 One watch item, reported for completeness and not as a finding. MLB team-level pairs in weeks 1-2 of
 the season: in 2021-25 (189 pairs, where it was noticed) residual correlation +0.23 and phi +0.19; in the
@@ -65,13 +79,23 @@ scepticism: the continuous correlation does not replicate, the per-season sign i
 sample, no other sport shows an early-season effect (NFL, NBA, NHL and soccer weeks 1-2 are all within
 noise of zero or negative), the Gaussian theory predicts ~0.0005 for MLB, and this is one of roughly
 sixty subsets examined across sports, so one nominal p~0.03 is what chance produces. Early-season
-favourite calibration (+1.9 points) is too small to explain it. It would take the 2026 and 2027 seasons
-(about 100 qualifying pairs per season) to confirm or kill it.
+favourite calibration (+1.9 points on the legs of those pairs) cannot explain it: shifting favourites up by
+that amount lowers the independence baseline, so the "edge" would grow, not shrink. The composition also
+differs between the two samples (2011-20: the same-side excess is in favourite/underdog mixed pairs;
+2021-25: in both-favourite and both-underdog pairs), which is what noise looks like. At 15-60 qualifying
+pairs per season it would take several more seasons (2026 onward) to confirm or kill it.
 
 Caveats: soccer odds are pre-match snapshots, not closing; the soccer moneyline "edge" is contaminated by
 the favourite-longshot bias in the proportional vig removal (the independence baseline is too
 optimistic for longshot legs), so use the residual correlations and same-side rates there; NBA spreads
-before 2022-23 were re-signed from an unsigned source; NHL goalies are unavailable.
+before 2022-23 were re-signed from an unsigned source (about 1.6% of rows dropped, see the NBA section);
+the NHL archive dated the 2020 bubble playoffs and Jan-Mar 2021 a year early and those dates were
+corrected; NHL goalies are unavailable; the repaired 2011-20 MLB archive cannot recover the last game
+listed on each date (about 8% of games, concentrated on WAS/PHI/PIT/CHC/MIA/NYM/CIN), so for those teams
+"next game" is sometimes the game after next; the moneyline-to-margin scale `sd` and the soccer margin fit
+are single sport-level constants fitted on all seasons (they carry no team or date information, but
+residual signs near zero depend on them); bootstrap CIs resample pairs independently, and cluster
+bootstraps by anchor day, season-week and season give the same intervals to within 0.01.
 """
 
 
@@ -142,6 +166,25 @@ def run_sport(sport: str, cfg: MultiSportConfig, pcfg: ParlayConfig) -> list[str
             f"Implied goal margin = {games['margin_fit'].iloc[0]}; draws are a priced outcome, so the moneyline parlay "
             "below uses the 3-way fair probabilities. 'promoted' = a team not in the division the previous season.\n"
         )
+    if sport == "nba" and "nba_rows_in" in games.attrs:
+        a = games.attrs
+        out.append(
+            f"Source cleaning: {a['nba_rows_in']} rows; dropped {a['nba_rows_dropped_inconsistent']} whose (re)signed spread "
+            f"disagrees with the moneyline by more than {6.0:g} points, {a['nba_rows_dropped_even_ml']} unsigned rows with an "
+            f"even moneyline (sign unrecoverable), {a['nba_rows_dropped_no_ml']} without a moneyline; whole months dropped: "
+            f"{a['nba_months_dropped'] or 'none'}. Seasons 2007-08 to 2021-22 store |spread| and were re-signed by moneyline favourite.\n"
+        )
+    if sport == "nhl" and "archive_rows_redated" in games.attrs:
+        out.append(
+            f"Source cleaning: {games.attrs['archive_rows_redated']} games the archive dated a year early (2019-20 bubble "
+            "playoffs dated Aug-Sep 2019; Jan-Mar 2021 dated 2020) were moved forward one year so that week 1 and the "
+            "next-game ordering are chronological. No goalie data.\n"
+        )
+    if sport in ("mlb", "mlb_2011_2020"):
+        out.append(
+            "Week 1 starts at the season's first game, so seasons with an international opening series (2014, 2019 in the "
+            "archive, 2024, 2025) have a short week 1-2 window with few pairs.\n"
+        )
     slope = np.polyfit(games["spread_line"], games["result"], 1)[0]
     out.append(
         f"{len(games)} games, seasons {games['season'].min()}–{games['season'].max()}, "
@@ -199,20 +242,25 @@ def run_sport(sport: str, cfg: MultiSportConfig, pcfg: ParlayConfig) -> list[str
     train = games[games["season"] <= spec["train_end"]]
     test = games[games["season"] > spec["train_end"]]
     print(f"[{sport}] fitting Kalman on seasons <= {spec['train_end']}", file=sys.stderr, flush=True)
-    init = KalmanParams(prior_std=games["resid"].std() * 0.2, process_std=0.05 * games["resid"].std(), obs_std=games["resid"].std(), persistence=0.95)
+    init = KalmanParams(prior_std=train["resid"].std() * 0.2, process_std=0.05 * train["resid"].std(), obs_std=train["resid"].std(), persistence=0.95)
     fitted = MarketErrorKalman(init, slate_col="week").fit(train, max_iter=150)  # weekly slates: fast, same hyperparameters
     kf = MarketErrorKalman(fitted, slate_col="gameday")
     lat, nxt = gaussian_explaining_away_corr(fitted.prior_std, fitted.obs_std)
     res = kf.run(test)
     kp = res.pairs
     sl, se, pv = kalman_slope(kp)
+    degenerate = kp["pred_cov"].abs().max() < 1e-9  # team-level uncertainty collapsed: slopes are 1/0 noise
     print(f"[{sport}] Kalman done: {fitted}", file=sys.stderr, flush=True)
+    slope_txt = (
+        "not defined (all predicted covariances are numerically zero)" if degenerate
+        else f"{sl:.2f} (se {se:.2f}, p={pv:.3f})"
+    )
     out.append(
         f"Fitted on seasons ≤{spec['train_end']}: prior_std={fitted.prior_std:.3f}, process_std={fitted.process_std:.3f}, "
         f"obs_std={fitted.obs_std:.3f}, persistence={fitted.persistence:.3f}. One-shared-game theory: latent corr {lat:.4f}, "
         f"next-game residual corr {nxt:.5f} (break-even {be:.3f}). Out-of-sample {len(kp)} same-day pairs, predicted |corr| "
         f"max {kp['pred_corr'].abs().max():.4f}, mean {kp['pred_corr'].abs().mean():.5f}. Calibration slope of realized "
-        f"residual product on predicted covariance: {sl:.2f} (se {se:.2f}, p={pv:.3f}).\n"
+        f"residual product on predicted covariance: {slope_txt}.\n"
     )
     if kp["pred_corr"].nunique() > 5:
         cal = kalman_pair_calibration(kp, n_quantiles=5)
@@ -226,11 +274,16 @@ def run_sport(sport: str, cfg: MultiSportConfig, pcfg: ParlayConfig) -> list[str
     rt = two_sided_parlay_roi(top["resid_1"], top["resid_2"], d, 1)
     rb = two_sided_parlay_roi(bot["resid_1"], bot["resid_2"], d, -1)
     out.append(f"Top decile predicted positive corr: {rt.n_pairs} pairs, same-sign {rt.hit_rate:.4f}, ROI {rt.roi:+.4f}. "
-               f"Bottom decile: {rb.n_pairs} pairs, opposite-sign {rb.hit_rate:.4f}, ROI {rb.roi:+.4f}.\n")
-    mres = stats.linregress(res.games["pred_mean"], res.games["resid"])
+               f"Bottom decile: {rb.n_pairs} pairs, opposite-sign {rb.hit_rate:.4f}, ROI {rb.roi:+.4f}."
+               + (" (Deciles are ill-defined here: most predicted correlations are tied at zero.)" if degenerate else "") + "\n")
     tgm = tg[tg["next_resid"].notna()]
     lag1 = np.corrcoef(tgm["resid"], tgm["next_resid"])[0, 1]
-    out.append(f"Marginal check: slope of realized residual on Kalman predicted mean {mres.slope:.2f} (se {mres.stderr:.2f}); "
+    if res.games["pred_mean"].abs().max() < 1e-9:
+        mtxt = "not defined (all predicted means are numerically zero)"
+    else:
+        mres = stats.linregress(res.games["pred_mean"], res.games["resid"])
+        mtxt = f"{mres.slope:.2f} (se {mres.stderr:.2f})"
+    out.append(f"Marginal check: slope of realized residual on Kalman predicted mean {mtxt}; "
                f"within-team lag-1 residual autocorrelation {lag1:+.4f} (n={len(tgm)}).\n")
     # MLB pitchers
     if sport == "mlb" and games["home_qb_id"].notna().any():
