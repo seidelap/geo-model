@@ -17,8 +17,10 @@ This module measures how large such factors are *relative to the closing line*:
 * strictly causal persistence of the slate-mean residual (does the mean over
   the previous ``k`` weeks predict this week's residuals?);
 * a scalar-state Kalman filter on the league offset (AR(1) with process noise,
-  extra innovation at season boundaries), whose prior variance at each slate
-  is the model's predicted same-week pair covariance;
+  a separate transition at season boundaries), whose prior variance at each
+  slate is the model's predicted same-week pair covariance, plus a profile
+  likelihood over the stationary size of the factor (an upper bound on how
+  large a shared factor the data allow);
 * parlay implications: same-sign rates, two-sided parlay ROI, and a directional
   slate strategy, with confidence intervals that resample whole slates because
   same-week pairs share games.
@@ -30,7 +32,7 @@ Residual conventions follow :mod:`geo_model.parlay.data`: ``tresid`` is
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -245,14 +247,14 @@ class IccResult:
         return {
             "n": self.n,
             "groups": self.n_groups,
-            "icc": round(self.icc, 4),
+            "icc": round(float(self.icc), 4),
             "icc_ci": f"[{self.boot_ci[0]:+.4f}, {self.boot_ci[1]:+.4f}]",
-            "pairwise": round(self.pairwise_corr, 4),
-            "F": round(self.f_stat, 3),
-            "perm_mean": round(self.perm_mean, 4),
-            "perm_sd": round(self.perm_sd, 4),
-            "perm_p": round(self.perm_p, 3),
-            "perm_p_two": round(self.perm_p_two, 3),
+            "pairwise": round(float(self.pairwise_corr), 4),
+            "F": round(float(self.f_stat), 3),
+            "perm_mean": round(float(self.perm_mean), 4),
+            "perm_sd": round(float(self.perm_sd), 4),
+            "perm_p": round(float(self.perm_p), 3),
+            "perm_p_two": round(float(self.perm_p_two), 3),
         }
 
 
@@ -756,23 +758,32 @@ def persistence_table(
 # ---------------------------------------------------------------------------
 
 
+def _clip_unit(x: float, eps: float = 1e-6) -> float:
+    return float(min(max(x, eps), 1.0 - eps))
+
+
 @dataclass(frozen=True)
 class ScalarFactorParams:
     """Hyperparameters of the league-offset AR(1) model.
 
-    The offset ``theta`` evolves between consecutive slates as
-    ``theta' = mean + persistence * (theta - mean) + eta`` with
-    ``eta ~ N(0, process_std²)``, plus an extra ``N(0, season_std²)`` innovation
-    when the slate starts a new season. Each game observes
-    ``theta + N(0, obs_std²)``.
+    Between consecutive slates of the same season the offset ``theta`` evolves
+    as ``theta' = mean + persistence * (theta - mean) + N(0, process_std²)``;
+    across a season boundary it evolves as
+    ``theta' = mean + season_persistence * (theta - mean) + N(0, season_std²)``.
+    Each game on a slate observes ``theta + N(0, obs_std²)``, so two games on
+    the same slate have covariance ``Var(theta)`` and correlation
+    ``Var(theta) / (Var(theta) + obs_std²)``.
 
     Attributes:
         prior_std: Std of the offset before the first slate of the sample.
         process_std: Week-to-week innovation std (points).
-        season_std: Additional innovation std at a season boundary (points).
+        season_std: Innovation std across a season boundary (points).
         obs_std: Single-game noise std (points).
-        persistence: AR(1) coefficient between slates.
-        mean: Long-run level the offset reverts to (points).
+        persistence: AR(1) coefficient between consecutive slates.
+        season_persistence: AR(1) coefficient across a season boundary.
+        mean: Long-run level the offset reverts to (points). This is the
+            market's persistent bias: a marginal (single-bet) effect, not a
+            source of cross-game correlation.
     """
 
     prior_std: float = 2.0
@@ -780,17 +791,21 @@ class ScalarFactorParams:
     season_std: float = 1.0
     obs_std: float = 13.0
     persistence: float = 0.95
+    season_persistence: float = 0.5
     mean: float = 0.0
 
     def to_vector(self) -> np.ndarray:
         """Unconstrained parameterization for the optimizer."""
+        rho = _clip_unit(self.persistence)
+        rho_s = _clip_unit(self.season_persistence)
         return np.array(
             [
-                np.log(self.prior_std),
-                np.log(self.process_std),
-                np.log(self.season_std),
-                np.log(self.obs_std),
-                np.log(self.persistence / (1 - self.persistence)),
+                np.log(max(self.prior_std, 1e-9)),
+                np.log(max(self.process_std, 1e-9)),
+                np.log(max(self.season_std, 1e-9)),
+                np.log(max(self.obs_std, 1e-9)),
+                np.log(rho / (1 - rho)),
+                np.log(rho_s / (1 - rho_s)),
                 self.mean,
             ]
         )
@@ -804,8 +819,155 @@ class ScalarFactorParams:
             season_std=float(np.exp(v[2])),
             obs_std=float(np.exp(v[3])),
             persistence=float(1 / (1 + np.exp(-v[4]))),
-            mean=float(v[5]),
+            season_persistence=float(1 / (1 + np.exp(-v[5]))),
+            mean=float(v[6]),
         )
+
+    @classmethod
+    def stationary(
+        cls,
+        factor_std: float,
+        obs_std: float,
+        mean: float = 0.0,
+        persistence: float = 0.9,
+        season_persistence: float = 0.5,
+    ) -> "ScalarFactorParams":
+        """Parameters whose offset has stationary std ``factor_std`` at every slate.
+
+        Args:
+            factor_std: Stationary std of the shared offset (points).
+            obs_std: Single-game noise std (points).
+            mean: Long-run offset level.
+            persistence: Within-season AR(1) coefficient.
+            season_persistence: Across-season AR(1) coefficient.
+
+        Returns:
+            Parameters with innovations ``factor_std * sqrt(1 - rho²)`` so that
+            the marginal variance of the offset is ``factor_std²`` before and
+            after every transition.
+        """
+        return cls(
+            prior_std=factor_std,
+            process_std=factor_std * float(np.sqrt(1 - persistence**2)),
+            season_std=factor_std * float(np.sqrt(1 - season_persistence**2)),
+            obs_std=obs_std,
+            persistence=persistence,
+            season_persistence=season_persistence,
+            mean=mean,
+        )
+
+    @property
+    def stationary_std(self) -> float:
+        """Stationary std of the within-season AR(1) (``inf`` when persistence is 1)."""
+        if self.persistence >= 1.0:
+            return float("inf")
+        return float(self.process_std / np.sqrt(1 - self.persistence**2))
+
+    def pair_corr(self, state_var: float) -> float:
+        """Same-slate pair correlation implied by an offset variance."""
+        return float(state_var / (state_var + self.obs_std**2))
+
+
+@dataclass
+class SlateStats:
+    """Per-slate sufficient statistics of a residual, in chronological order.
+
+    The Gaussian predictive density of a slate depends on its residuals only
+    through ``n``, ``sum`` and ``sum of squares``, so the filter and the
+    likelihood can run on these arrays without touching the games table.
+
+    Attributes:
+        season: Season of each slate ``[S]``.
+        week: Week of each slate ``[S]``.
+        n: Games on each slate ``[S]``.
+        total: Sum of residuals per slate ``[S]``.
+        total_sq: Sum of squared residuals per slate ``[S]``.
+    """
+
+    season: np.ndarray
+    week: np.ndarray
+    n: np.ndarray
+    total: np.ndarray
+    total_sq: np.ndarray
+
+    def __len__(self) -> int:
+        return int(len(self.n))
+
+
+def slate_stats(games: pd.DataFrame, value_col: str) -> SlateStats:
+    """Sufficient statistics of ``value_col`` per (season, week) slate.
+
+    Args:
+        games: Games with ``season, week`` and ``value_col``.
+        value_col: Residual column (NaNs are dropped).
+
+    Returns:
+        :class:`SlateStats` sorted by (season, week).
+    """
+    d = games.loc[games[value_col].notna(), ["season", "week", value_col]]
+    v = d[value_col].to_numpy(dtype=float)
+    agg = (
+        d.assign(_v=v, _v2=v * v)
+        .groupby(["season", "week"], sort=True)
+        .agg(n=("_v", "size"), total=("_v", "sum"), total_sq=("_v2", "sum"))
+        .reset_index()
+    )
+    return SlateStats(
+        season=agg["season"].to_numpy(dtype=int),
+        week=agg["week"].to_numpy(dtype=int),
+        n=agg["n"].to_numpy(dtype=float),
+        total=agg["total"].to_numpy(dtype=float),
+        total_sq=agg["total_sq"].to_numpy(dtype=float),
+    )
+
+
+def _filter_core(
+    stats: SlateStats, p: ScalarFactorParams
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """Run the scalar Kalman filter over slate statistics.
+
+    Args:
+        stats: Slate sufficient statistics.
+        p: Model parameters.
+
+    Returns:
+        ``(prior_mean, prior_var, post_mean, post_var, log_likelihood)`` where the
+        arrays are ``[S]`` and the prior quantities for slate ``t`` use only
+        slates ``< t``.
+    """
+    S = len(stats)
+    r2 = p.obs_std**2
+    prior_m = np.empty(S)
+    prior_P = np.empty(S)
+    post_m = np.empty(S)
+    post_P = np.empty(S)
+    m = p.mean
+    P = p.prior_std**2
+    ll = 0.0
+    for t in range(S):
+        if t > 0:
+            if stats.season[t] != stats.season[t - 1]:
+                rho, q2 = p.season_persistence, p.season_std**2
+            else:
+                rho, q2 = p.persistence, p.process_std**2
+            m = p.mean + rho * (m - p.mean)
+            P = rho * rho * P + q2
+        n, s, s2 = stats.n[t], stats.total[t], stats.total_sq[t]
+        prior_m[t], prior_P[t] = m, P
+        # Predictive density of the slate: y ~ N(m 1, P 11' + r2 I).
+        dev_sum = s - n * m
+        dev_sq = s2 - 2 * m * s + n * m * m
+        shrink = P / (r2 + n * P)
+        quad = (dev_sq - shrink * dev_sum * dev_sum) / r2
+        logdet = n * np.log(r2) + np.log1p(n * P / r2)
+        ll += -0.5 * (n * np.log(2 * np.pi) + logdet + quad)
+        # Posterior update with all n observations at once (gain form, stable
+        # as P -> 0): gain on the slate sum is P / (r2 + n P).
+        m_new = m + shrink * dev_sum
+        P_new = P * r2 / (r2 + n * P)
+        post_m[t], post_P[t] = m_new, P_new
+        m, P = m_new, P_new
+    return prior_m, prior_P, post_m, post_P, float(ll)
 
 
 @dataclass
@@ -821,11 +983,22 @@ class ScalarFactorOutput:
         slates: One row per slate: ``season, week, n_games, pred_mean, state_var,
             pred_pair_corr, slate_mean, post_mean, post_var``.
         log_likelihood: Sum of Gaussian predictive log densities over slates.
+        params: Parameters used for the pass.
     """
 
     games: pd.DataFrame
     slates: pd.DataFrame
     log_likelihood: float
+    params: ScalarFactorParams
+
+    def factor_collapsed(self, tol: float = 1e-6) -> bool:
+        """True when the predicted offset variance is negligible on every slate.
+
+        A maximum-likelihood fit that finds no shared factor drives the state
+        variance to (numerically) zero; calibration regressions on such
+        predictions are not identified.
+        """
+        return bool(len(self.slates) == 0 or self.slates["state_var"].max() < tol)
 
 
 class ScalarFactorKalman:
@@ -851,84 +1024,69 @@ class ScalarFactorKalman:
             :class:`ScalarFactorOutput`.
         """
         p = self.params
-        r2 = p.obs_std**2
-        m = p.mean
-        P = p.prior_std**2
-        ll = 0.0
-        game_rows: list[pd.DataFrame] = []
-        slate_rows: list[dict] = []
-        prev_season: int | None = None
-        d = games.loc[games[self.value_col].notna()].sort_values(["season", "week", "game_id"])
-        for (season, week), sg in d.groupby(["season", "week"], sort=True):
-            if prev_season is not None:
-                m = p.mean + p.persistence * (m - p.mean)
-                P = p.persistence**2 * P + p.process_std**2
-                if season != prev_season:
-                    P += p.season_std**2
-            prev_season = int(season)
-            y = sg[self.value_col].to_numpy(dtype=float)
-            n = len(y)
-            dev = y - m
-            # Predictive density of the slate: y ~ N(m 1, P 11' + r2 I).
-            shrink = P / (r2 + n * P)
-            quad = (np.sum(dev**2) - shrink * np.sum(dev) ** 2) / r2
-            logdet = n * np.log(r2) + np.log1p(n * P / r2)
-            ll += float(-0.5 * (n * np.log(2 * np.pi) + logdet + quad))
-            pair_corr = P / (P + r2)
-            game_rows.append(
-                pd.DataFrame(
-                    {
-                        "game_id": sg["game_id"].to_numpy(),
-                        "season": int(season),
-                        "week": int(week),
-                        "resid": y,
-                        "pred_mean": m,
-                        "pred_var": P + r2,
-                        "state_var": P,
-                        "pred_pair_corr": pair_corr,
-                    }
-                )
-            )
-            # Posterior update with all n observations at once.
-            post_prec = 1.0 / P + n / r2
-            post_var = 1.0 / post_prec
-            post_mean = post_var * (m / P + np.sum(y) / r2)
-            slate_rows.append(
-                {
-                    "season": int(season),
-                    "week": int(week),
-                    "n_games": n,
-                    "pred_mean": m,
-                    "state_var": P,
-                    "pred_pair_corr": pair_corr,
-                    "slate_mean": float(y.mean()),
-                    "post_mean": post_mean,
-                    "post_var": post_var,
-                }
-            )
-            m, P = post_mean, post_var
-        games_out = pd.concat(game_rows, ignore_index=True) if game_rows else pd.DataFrame()
-        return ScalarFactorOutput(games=games_out, slates=pd.DataFrame(slate_rows), log_likelihood=ll)
+        stats = slate_stats(games, self.value_col)
+        prior_m, prior_P, post_m, post_P, ll = _filter_core(stats, p)
+        pair_corr = prior_P / (prior_P + p.obs_std**2)
+        slates = pd.DataFrame(
+            {
+                "season": stats.season,
+                "week": stats.week,
+                "n_games": stats.n.astype(int),
+                "pred_mean": prior_m,
+                "state_var": prior_P,
+                "pred_pair_corr": pair_corr,
+                "slate_mean": stats.total / np.maximum(stats.n, 1.0),
+                "post_mean": post_m,
+                "post_var": post_P,
+            }
+        )
+        d = games.loc[games[self.value_col].notna(), ["game_id", "season", "week", self.value_col]]
+        d = d.sort_values(["season", "week", "game_id"]).rename(columns={self.value_col: "resid"})
+        key = pd.MultiIndex.from_arrays([stats.season, stats.week])
+        idx = key.get_indexer(pd.MultiIndex.from_frame(d[["season", "week"]]))
+        games_out = d.assign(
+            pred_mean=prior_m[idx],
+            pred_var=prior_P[idx] + p.obs_std**2,
+            state_var=prior_P[idx],
+            pred_pair_corr=pair_corr[idx],
+        ).reset_index(drop=True)
+        return ScalarFactorOutput(games=games_out, slates=slates, log_likelihood=ll, params=p)
 
-    def fit(self, games: pd.DataFrame, max_iter: int = 600) -> ScalarFactorParams:
+    def fit(self, games: pd.DataFrame, max_iter: int = 4000, n_starts: int = 3) -> ScalarFactorParams:
         """Maximize predictive log-likelihood on training seasons.
+
+        Nelder-Mead from several starting points (the current parameters, a
+        no-factor start and a large-factor start); the best optimum is kept.
 
         Args:
             games: Training games (must precede any evaluation games).
-            max_iter: Nelder-Mead iteration budget.
+            max_iter: Nelder-Mead iteration budget per start.
+            n_starts: Number of starting points to use (1-3).
 
         Returns:
             Fitted parameters (also stored on ``self.params``).
         """
+        stats = slate_stats(games, self.value_col)
 
         def neg_ll(v: np.ndarray) -> float:
-            params = ScalarFactorParams.from_vector(v)
-            return -ScalarFactorKalman(params, self.value_col).run(games).log_likelihood
+            return -_filter_core(stats, ScalarFactorParams.from_vector(v))[4]
 
-        res = optimize.minimize(
-            neg_ll, self.params.to_vector(), method="Nelder-Mead", options={"maxiter": max_iter, "xatol": 1e-4, "fatol": 1e-4}
-        )
-        self.params = ScalarFactorParams.from_vector(res.x)
+        obs0 = float(np.sqrt(np.sum(stats.total_sq) / np.sum(stats.n)))
+        mean0 = float(np.sum(stats.total) / np.sum(stats.n))
+        starts = [
+            self.params,
+            ScalarFactorParams(0.1, 0.05, 0.1, obs0, 0.9, 0.5, mean0),
+            ScalarFactorParams.stationary(3.0, obs0, mean0, 0.9, 0.5),
+        ][: max(1, n_starts)]
+        best: tuple[float, ScalarFactorParams] | None = None
+        for s in starts:
+            res = optimize.minimize(
+                neg_ll, s.to_vector(), method="Nelder-Mead", options={"maxiter": max_iter, "xatol": 1e-5, "fatol": 1e-6}
+            )
+            if best is None or res.fun < best[0]:
+                best = (float(res.fun), ScalarFactorParams.from_vector(res.x))
+        assert best is not None
+        self.params = best[1]
         return self.params
 
 
@@ -957,8 +1115,11 @@ def simulate_common_factor(
     prev_season: int | None = None
     for (season, _), sg in out.groupby(["season", "week"], sort=True):
         if prev_season is not None:
-            sd = params.process_std**2 + (params.season_std**2 if season != prev_season else 0.0)
-            theta = params.mean + params.persistence * (theta - params.mean) + rng.normal(0, np.sqrt(sd))
+            if season != prev_season:
+                rho, sd = params.season_persistence, params.season_std
+            else:
+                rho, sd = params.persistence, params.process_std
+            theta = params.mean + rho * (theta - params.mean) + rng.normal(0, sd)
         prev_season = int(season)
         out.loc[sg.index, value_col] = theta + rng.normal(0, params.obs_std, len(sg))
         out.loc[sg.index, "true_offset"] = theta
@@ -976,16 +1137,144 @@ def kalman_pair_calibration(output: ScalarFactorOutput, value_col: str = "resid"
         ``(cov_slope, mean_slope)``: OLS of realized same-slate residual
         products on predicted covariance ``state_var`` (1 = calibrated), and
         OLS of realized residuals on ``pred_mean`` (1 = the market under-reacts
-        exactly as the filter says, 0 = market efficient). Both cluster by slate.
+        exactly as the filter says, 0 = market efficient). Both cluster by
+        slate. ``cov_slope`` is all-NaN when the fitted factor has collapsed
+        to zero variance (see :meth:`ScalarFactorOutput.factor_collapsed`).
     """
     g = output.games
+    nan = float("nan")
+    cl = g["season"].astype(str) + "_" + g["week"].astype(str)
+    mean_slope = ols_clustered(g["pred_mean"], g[value_col], cl)
+    if output.factor_collapsed():
+        return OlsResult(nan, nan, nan, nan, nan, 0, 0), mean_slope
     pairs = same_slate_pairs(g.rename(columns={value_col: "v"}), "v", ("season", "week"))
     cov = g.groupby(["season", "week"])["state_var"].first()
     pairs["pred_cov"] = cov.reindex(pd.MultiIndex.from_frame(pairs[["season", "week"]])).to_numpy()
     cov_slope = ols_clustered(pairs["pred_cov"], pairs["x"] * pairs["y"], pairs["slate"])
-    cl = g["season"].astype(str) + "_" + g["week"].astype(str)
-    mean_slope = ols_clustered(g["pred_mean"], g[value_col], cl)
     return cov_slope, mean_slope
+
+
+def icc_by_uncertainty(output: ScalarFactorOutput, n_bins: int = 4) -> pd.DataFrame:
+    """Realized within-slate ICC in bins of the filter's predicted uncertainty.
+
+    If the filter is right, slates where its prior variance is largest (after
+    a season boundary, or after slates with few games) should show the largest
+    realized clustering.
+
+    Args:
+        output: :class:`ScalarFactorOutput` for the evaluation window.
+        n_bins: Quantile bins of ``state_var`` over slates.
+
+    Returns:
+        One row per bin: ``bin, slates, games, pred_pair_corr, icc, pairwise,
+        pairs``.
+    """
+    sl = output.slates
+    if len(sl) == 0:
+        return pd.DataFrame(columns=["bin", "slates", "games", "pred_pair_corr", "icc", "pairwise", "pairs"])
+    ranks = sl["state_var"].rank(method="first")
+    sl = sl.assign(bin=pd.qcut(ranks, q=min(n_bins, len(sl)), labels=False))
+    g = output.games.merge(sl[["season", "week", "bin"]], on=["season", "week"])
+    rows = []
+    for b, gb in g.groupby("bin", sort=True):
+        codes = group_codes(gb, ("season", "week"))
+        r = icc_oneway(gb["resid"].to_numpy(), codes)
+        rows.append(
+            {
+                "bin": int(b),
+                "slates": int(sl.loc[sl["bin"] == b].shape[0]),
+                "games": int(len(gb)),
+                "pred_pair_corr": float(gb["pred_pair_corr"].mean()),
+                "icc": float(r.icc),
+                "pairwise": float(r.pairwise_corr),
+                "pairs": int(r.n_pairs),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def factor_profile(
+    games: pd.DataFrame,
+    value_col: str,
+    factor_stds: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0),
+    persistence: float = 0.9,
+    season_persistence: float = 0.5,
+) -> pd.DataFrame:
+    """Profile log-likelihood over the stationary size of the shared factor.
+
+    For each ``factor_std`` the offset is a stationary AR(1) with that std and
+    fixed persistence; ``obs_std`` and ``mean`` are re-optimized (nuisance
+    parameters). ``delta_ll`` is relative to ``factor_std = 0``; the usual 95%
+    profile-likelihood bound is the largest ``factor_std`` with
+    ``delta_ll >= -1.92``.
+
+    Args:
+        games: Games with ``season, week, value_col``.
+        value_col: Residual column.
+        factor_stds: Grid of stationary factor stds (points), should include 0.
+        persistence: Within-season AR(1) coefficient held fixed.
+        season_persistence: Across-season AR(1) coefficient held fixed.
+
+    Returns:
+        One row per grid point: ``factor_std, obs_std, mean, log_likelihood,
+        delta_ll, pair_corr_stationary`` (``s² / (s² + obs²)``, what a bettor
+        who ignores history faces) and ``pair_corr_filtered`` (mean over slates
+        of the filter's prior ``P / (P + obs²)``, what remains after learning).
+    """
+    stats = slate_stats(games, value_col)
+    obs0 = float(np.sqrt(np.sum(stats.total_sq) / np.sum(stats.n)))
+    mean0 = float(np.sum(stats.total) / np.sum(stats.n))
+    rows = []
+    for s in factor_stds:
+
+        def neg_ll(v: np.ndarray, s: float = float(s)) -> float:
+            p = ScalarFactorParams.stationary(s, float(np.exp(v[0])), float(v[1]), persistence, season_persistence)
+            return -_filter_core(stats, p)[4]
+
+        res = optimize.minimize(neg_ll, np.array([np.log(obs0), mean0]), method="Nelder-Mead", options={"xatol": 1e-6, "fatol": 1e-8})
+        obs_std, mean = float(np.exp(res.x[0])), float(res.x[1])
+        p = ScalarFactorParams.stationary(float(s), obs_std, mean, persistence, season_persistence)
+        _, prior_P, _, _, ll = _filter_core(stats, p)
+        rows.append(
+            {
+                "factor_std": float(s),
+                "obs_std": obs_std,
+                "mean": mean,
+                "log_likelihood": ll,
+                "pair_corr_stationary": p.pair_corr(float(s) ** 2),
+                "pair_corr_filtered": float(np.mean(prior_P / (prior_P + obs_std**2))),
+            }
+        )
+    out = pd.DataFrame(rows)
+    base = out.loc[out["factor_std"] == out["factor_std"].min(), "log_likelihood"].iloc[0]
+    out["delta_ll"] = out["log_likelihood"] - base
+    return out
+
+
+def profile_upper_bound(profile: pd.DataFrame, threshold: float = 1.92) -> float:
+    """Largest factor std whose profile log-likelihood is within ``threshold`` of the best.
+
+    Linear interpolation between the last grid point inside the bound and the
+    first outside it. Returns the largest grid value if no point is outside.
+
+    Args:
+        profile: Output of :func:`factor_profile`.
+        threshold: Log-likelihood drop defining the bound (1.92 for 95%).
+
+    Returns:
+        Upper bound on the stationary factor std (points).
+    """
+    pr = profile.sort_values("factor_std").reset_index(drop=True)
+    rel = (pr["log_likelihood"] - pr["log_likelihood"].max()).to_numpy()
+    s = pr["factor_std"].to_numpy(dtype=float)
+    i_max = int(np.argmax(rel))
+    outside = np.flatnonzero(rel[i_max:] < -threshold)
+    if len(outside) == 0:
+        return float(s[-1])
+    j = i_max + int(outside[0])  # first grid point past the maximum that is outside the bound
+    r0, r1 = rel[j - 1], rel[j]
+    frac = (r0 + threshold) / (r0 - r1) if r0 != r1 else 0.0
+    return float(s[j - 1] + frac * (s[j] - s[j - 1]))
 
 
 # ---------------------------------------------------------------------------
