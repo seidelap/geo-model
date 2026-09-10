@@ -12,6 +12,7 @@ sparse checkout of ``github.com/chadwickbureau/retrosheet``, ``seasons/`` dir).
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -90,6 +91,7 @@ def ml_row(label: str, r) -> dict:
 
 def run_sport(sport: str, cfg: MultiSportConfig, pcfg: ParlayConfig) -> list[str]:
     spec = SPORTS[sport]
+    print(f"[{sport}] loading", file=sys.stderr, flush=True)
     games = load(sport, cfg)
     tg = to_team_games(games, pcfg)
     pairs = build_shared_game_pairs(tg)
@@ -157,12 +159,15 @@ def run_sport(sport: str, cfg: MultiSportConfig, pcfg: ParlayConfig) -> list[str
     out.append("### Whole-network Kalman filter (daily slates)\n")
     train = games[games["season"] <= spec["train_end"]]
     test = games[games["season"] > spec["train_end"]]
-    kf = MarketErrorKalman(KalmanParams(prior_std=games["resid"].std() * 0.2, process_std=0.05 * games["resid"].std(), obs_std=games["resid"].std(), persistence=0.95), slate_col="gameday")
-    fitted = kf.fit(train)
+    print(f"[{sport}] fitting Kalman on seasons <= {spec['train_end']}", file=sys.stderr, flush=True)
+    init = KalmanParams(prior_std=games["resid"].std() * 0.2, process_std=0.05 * games["resid"].std(), obs_std=games["resid"].std(), persistence=0.95)
+    fitted = MarketErrorKalman(init, slate_col="week").fit(train, max_iter=150)  # weekly slates: fast, same hyperparameters
+    kf = MarketErrorKalman(fitted, slate_col="gameday")
     lat, nxt = gaussian_explaining_away_corr(fitted.prior_std, fitted.obs_std)
     res = kf.run(test)
     kp = res.pairs
     sl, se, pv = kalman_slope(kp)
+    print(f"[{sport}] Kalman done: {fitted}", file=sys.stderr, flush=True)
     out.append(
         f"Fitted on seasons ≤{spec['train_end']}: prior_std={fitted.prior_std:.3f}, process_std={fitted.process_std:.3f}, "
         f"obs_std={fitted.obs_std:.3f}, persistence={fitted.persistence:.3f}. One-shared-game theory: latent corr {lat:.4f}, "
@@ -170,10 +175,13 @@ def run_sport(sport: str, cfg: MultiSportConfig, pcfg: ParlayConfig) -> list[str
         f"max {kp['pred_corr'].abs().max():.4f}, mean {kp['pred_corr'].abs().mean():.5f}. Calibration slope of realized "
         f"residual product on predicted covariance: {sl:.2f} (se {se:.2f}, p={pv:.3f}).\n"
     )
-    cal = kalman_pair_calibration(kp, n_quantiles=5)
-    cal["n"] = cal["n"].astype(int)
-    cal["bin"] = cal["bin"].astype(int)
-    out.append(md_table(cal) + "\n")
+    if kp["pred_corr"].nunique() > 5:
+        cal = kalman_pair_calibration(kp, n_quantiles=5)
+        cal["n"] = cal["n"].astype(int)
+        cal["bin"] = cal["bin"].astype(int)
+        out.append(md_table(cal) + "\n")
+    else:
+        out.append("Predicted correlations are all (numerically) zero: the fitted team-level uncertainty collapsed, so no calibration table.\n")
     top = kp[kp["pred_corr"] >= kp["pred_corr"].quantile(0.9)]
     bot = kp[kp["pred_corr"] <= kp["pred_corr"].quantile(0.1)]
     rt = two_sided_parlay_roi(top["resid_1"], top["resid_2"], d, 1)

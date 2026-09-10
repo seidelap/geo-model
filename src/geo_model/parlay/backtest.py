@@ -278,5 +278,7 @@ def kalman_slope(pairs: pd.DataFrame) -> tuple[float, float, float]:
     """
     y = (pairs["resid_1"] * pairs["resid_2"]).to_numpy(dtype=float)
     x = pairs["pred_cov"].to_numpy(dtype=float)
+    if len(x) < 3 or np.ptp(x) == 0:
+        return float("nan"), float("nan"), float("nan")
     res = stats.linregress(x, y)
     return float(res.slope), float(res.stderr), float(res.pvalue)
