@@ -30,7 +30,7 @@ from geo_model.parlay import (
     two_sided_parlay_roi,
 )
 from geo_model.parlay.backtest import gaussian_explaining_away_corr, kalman_pair_calibration, kalman_slope
-from geo_model.parlay.data_multisport import MultiSportConfig, load_mlb, load_nba, load_sbr_archive
+from geo_model.parlay.data_multisport import MultiSportConfig, load_mlb, load_mlb_archive_repaired, load_nba, load_sbr_archive
 from geo_model.parlay.data_soccer import SoccerConfig, load_soccer
 from geo_model.parlay.multisport_backtest import build_pitcher_pairs, moneyline_parlay
 from geo_model.parlay.pairs import stratify
@@ -40,9 +40,39 @@ SPORTS = {
     "nba": dict(bins=(0.0, 7.0, 14.0, 1000.0), train_end=2013, market="spread"),
     "nhl": dict(bins=(0.0, 1.0, 2.0, 1000.0), train_end=2014, market="moneyline"),
     "mlb": dict(bins=(0.0, 2.0, 4.0, 1000.0), train_end=2022, market="moneyline"),
+    "mlb_2011_2020": dict(bins=(0.0, 2.0, 4.0, 1000.0), train_end=2014, market="moneyline"),
     "epl": dict(bins=(0.0, 1.0, 2.0, 1000.0), train_end=2012, market="moneyline"),
     "big5": dict(bins=(0.0, 1.0, 2.0, 1000.0), train_end=2012, market="moneyline"),
 }
+
+
+SUMMARY = """## Summary of findings
+
+All-pairs shared-game correlations are indistinguishable from zero in every sport and far below the
+hurdle: NBA -0.001 (20,661 pairs), NHL -0.022 (11,508), MLB 2021-25 +0.022 (3,549), MLB 2011-20 -0.004
+(7,076), Premier League -0.014 (9,413), big-five leagues -0.004 (43,634); NFL was +0.002 (6,488). Totals
+correlations, mechanical two-sided parlays (ROI -8% to -10%, i.e. the vig), the daily-slate Kalman filters
+(predicted |corr| never above 0.003; fitted market-error persistence collapses to ~0 in NHL, MLB and
+soccer, meaning closing lines carry no team-level error that survives to the next day) and the MLB
+starting-pitcher pairs (18,549 pairs, phi -0.000, moneyline-parlay edge +0.002) all agree.
+
+One watch item, reported for completeness and not as a finding. MLB team-level pairs in weeks 1-2 of
+the season: in 2021-25 (189 pairs, where it was noticed) residual correlation +0.23 and phi +0.19; in the
+pre-registered out-of-sample 2011-20 check (490 pairs) residual correlation +0.01 (CI -0.07 to +0.09),
+phi +0.07 (CI -0.03 to +0.15), same-side rate 55.7% vs 49.9% expected, moneyline-parlay edge +9.5% per
+unit (CI +0.7% to +17.5%). Pooled 2011-25 (679 pairs): phi 0.10 (CI 0.02 to 0.18). Reasons for
+scepticism: the continuous correlation does not replicate, the per-season sign is split 5-5 out of
+sample, no other sport shows an early-season effect (NFL, NBA, NHL and soccer weeks 1-2 are all within
+noise of zero or negative), the Gaussian theory predicts ~0.0005 for MLB, and this is one of roughly
+sixty subsets examined across sports, so one nominal p~0.03 is what chance produces. Early-season
+favourite calibration (+1.9 points) is too small to explain it. It would take the 2026 and 2027 seasons
+(about 100 qualifying pairs per season) to confirm or kill it.
+
+Caveats: soccer odds are pre-match snapshots, not closing; the soccer moneyline "edge" is contaminated by
+the favourite-longshot bias in the proportional vig removal (the independence baseline is too
+optimistic for longshot legs), so use the residual correlations and same-side rates there; NBA spreads
+before 2022-23 were re-signed from an unsigned source; NHL goalies are unavailable.
+"""
 
 
 def md_table(df: pd.DataFrame) -> str:
@@ -73,6 +103,8 @@ def load(sport: str, cfg: MultiSportConfig) -> pd.DataFrame:
         return load_nba(cfg)
     if sport == "nhl":
         return load_sbr_archive("nhl", cfg)
+    if sport == "mlb_2011_2020":
+        return load_mlb_archive_repaired(cfg)
     if sport == "epl":
         return load_soccer(SoccerConfig(divisions=("E0",)))
     if sport == "big5":
@@ -98,6 +130,12 @@ def run_sport(sport: str, cfg: MultiSportConfig, pcfg: ParlayConfig) -> list[str
     d = pcfg.leg_decimal
     be = breakeven_correlation(d)
     out = [f"## {sport.upper()}\n"]
+    if sport == "mlb_2011_2020":
+        out.append(
+            "Repaired 10-year SportsBookReview archive (row misalignment fixed by shifting the away-side fields up one row "
+            "within each date; validated on the 2021 overlap: 97.9% exact score agreement, moneyline correlation 0.96). "
+            "No starting pitchers. Serves as the out-of-sample check for the 2021-2025 early-season subset.\n"
+        )
     if sport in ("epl", "big5"):
         out.append(
             "Soccer (football-data.co.uk via the xgabora consolidation): pre-match 1X2 odds, not closing prices. "
@@ -119,6 +157,7 @@ def run_sport(sport: str, cfg: MultiSportConfig, pcfg: ParlayConfig) -> list[str
         m = sb == lab
         groups[f"|surprise| {lab}"] = (pairs.loc[m, "h_next_resid"], pairs.loc[m, "a_next_resid"])
     extra = {
+        "weeks 1-2 of season": pairs["week"] <= 2,
         "weeks 1-3 of season": pairs["week"] <= 3,
         "both legs same week": pairs["same_next_week"],
         "out-of-sample seasons": pairs["season"] > spec["train_end"],
@@ -147,7 +186,7 @@ def run_sport(sport: str, cfg: MultiSportConfig, pcfg: ParlayConfig) -> list[str
     rows.append({"strategy": "totals (over,under)+(under,over) @-110", "pairs": r.n_pairs, "roi": round(r.roi, 4), "same_sign": round(1 - r.hit_rate, 4), "needed": round(0.5 - be / 2, 4)})
     out.append(md_table(pd.DataFrame(rows)) + "\n")
     mlrows = [ml_row("all pairs", moneyline_parlay(pairs, tg, games))]
-    for lab, m in {"weeks 1-3": pairs["week"] <= 3, "|surprise| top bin": sb == sorted(sb.unique())[-1]}.items():
+    for lab, m in {"weeks 1-2": pairs["week"] <= 2, "weeks 1-3": pairs["week"] <= 3, "|surprise| top bin": sb == sorted(sb.unique())[-1]}.items():
         mlrows.append(ml_row(lab, moneyline_parlay(pairs[m], tg, games)))
     out.append(
         "Moneyline parlays at actual closing prices: (H wins, A wins) + (H loses, A loses), 1 unit each. "
@@ -230,7 +269,7 @@ def run_sport(sport: str, cfg: MultiSportConfig, pcfg: ParlayConfig) -> list[str
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sports", default="nba,nhl,mlb,epl,big5")
+    ap.add_argument("--sports", default="nba,nhl,mlb,mlb_2011_2020,epl,big5")
     ap.add_argument("--out", default="docs/experiments/parlay-multisport.md")
     args = ap.parse_args()
     cfg = MultiSportConfig()
@@ -248,6 +287,7 @@ def main() -> None:
     )
     out.append(f"Hurdle: 2-leg spread/total parlay at -110 needs phi > {be:.3f} (same-sign rate {0.5 + be / 2:.1%}). "
                f"Generated by `scripts/backtest_parlay_multisport.py`.\n")
+    out.append(SUMMARY)
     for sport in args.sports.split(","):
         out.extend(run_sport(sport.strip(), cfg, pcfg))
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)

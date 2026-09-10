@@ -267,7 +267,8 @@ def load_sbr_archive(sport: str, config: MultiSportConfig | None = None) -> pd.D
     """
     if sport == "mlb":
         raise ValueError(
-            "the 10-year MLB archive has mis-paired home/away rows (verified on 2019 Opening Day); use load_mlb()"
+            "the 10-year MLB archive has mis-paired home/away rows (verified on 2019 Opening Day); "
+            "use load_mlb() for 2021+ or load_mlb_archive_repaired() for 2011-2020"
         )
     config = config or MultiSportConfig()
     path = _download(config.sbr_url.format(sport=sport), config.data_dir / f"{sport}_archive_10Y.json")
@@ -421,3 +422,66 @@ def load_mlb(config: MultiSportConfig | None = None, with_pitchers: bool = True)
         clean["away_qb_id"] = clean["away_sp"]
         clean = clean.drop(columns=["home_sp", "away_sp"])
     return clean.drop(columns=["seq"]).reset_index(drop=True)
+
+
+MLB_NICKNAME_TO_CANON = {
+    "Diamondbacks": "ARI", "Braves": "ATL", "Orioles": "BAL", "Red Sox": "BOS", "Cubs": "CHC", "White Sox": "CHW",
+    "Reds": "CIN", "Indians": "CLE", "Guardians": "CLE", "Rockies": "COL", "Tigers": "DET", "Astros": "HOU",
+    "Royals": "KC", "Angels": "LAA", "Dodgers": "LAD", "Marlins": "MIA", "Brewers": "MIL", "Twins": "MIN",
+    "Mets": "NYM", "Yankees": "NYY", "Athletics": "OAK", "Phillies": "PHI", "Pirates": "PIT", "Padres": "SD",
+    "Mariners": "SEA", "Giants": "SF", "Cardinals": "STL", "Rays": "TB", "Rangers": "TEX", "Blue Jays": "TOR",
+    "Nationals": "WAS", "SFO": "SF", "SDG": "SD", "TAM": "TB", "TBR": "TB", "KAN": "KC", "CUB": "CHC", "CWS": "CHW",
+    "LOS": "LAD", "BRS": "BOS", "NYY": "NYY", "NYM": "NYM", "WAS": "WAS", "CHW": "CHW", "LAA": "LAA", "LAD": "LAD",
+    "ARI": "ARI", "ATL": "ATL", "BAL": "BAL", "BOS": "BOS", "CHC": "CHC", "CIN": "CIN", "CLE": "CLE", "COL": "COL",
+    "DET": "DET", "HOU": "HOU", "KC": "KC", "MIA": "MIA", "MIL": "MIL", "MIN": "MIN", "OAK": "OAK", "PHI": "PHI",
+    "PIT": "PIT", "SD": "SD", "SEA": "SEA", "SF": "SF", "STL": "STL", "TB": "TB", "TEX": "TEX", "TOR": "TOR",
+}
+
+
+def load_mlb_archive_repaired(config: MultiSportConfig | None = None, seasons: tuple[int, int] = (2011, 2020)) -> pd.DataFrame:
+    """MLB 2011-2020 from the 10-year archive after repairing its row misalignment.
+
+    In the source, row ``i`` carries the *away* side of game ``i`` in its
+    ``home_*`` fields and the *home* side of game ``i-1`` in its ``away_*``
+    fields (the scraper paired consecutive table rows). Shifting the ``away_*``
+    fields up by one row within each date restores the games: validated on the
+    2021 overlap with :func:`load_mlb` (2046 of 2209 games matched by date and
+    teams, 97.9% exact score agreement, moneyline correlation 0.96-0.97, total
+    line correlation 0.86 using the row-``i`` over/under).
+
+    Args:
+        config: File locations.
+        seasons: Inclusive season range to keep (2021 is available from the
+            clean multi-book file instead).
+
+    Returns:
+        Cleaned games table (moneyline-probit ``spread_line``); no pitchers.
+    """
+    config = config or MultiSportConfig()
+    path = _download(config.sbr_url.format(sport="mlb"), config.data_dir / "mlb_archive_10Y.json")
+    raw = pd.DataFrame(json.loads(Path(path).read_text())).reset_index(drop=True)
+    num = lambda c: pd.to_numeric(raw[c], errors="coerce")  # noqa: E731
+    date = num("date").astype("Int64")
+    nxt = raw.shift(-1)
+    nnum = lambda c: pd.to_numeric(nxt[c], errors="coerce")  # noqa: E731
+    out = pd.DataFrame(
+        {
+            "season": num("season").astype("Int64"),
+            "gameday": pd.to_datetime(date.astype(str), format="%Y%m%d", errors="coerce"),
+            "away_team": raw["home_team"].map(MLB_NICKNAME_TO_CANON),
+            "away_score": num("home_final"),
+            "away_moneyline": num("home_close_ml").replace(0.0, np.nan),
+            "home_team": nxt["away_team"].map(MLB_NICKNAME_TO_CANON),
+            "home_score": nnum("away_final"),
+            "home_moneyline": nnum("away_close_ml").replace(0.0, np.nan),
+            "total_line": num("close_over_under").replace(0.0, np.nan),
+            "same_date": date == pd.to_numeric(nxt["date"], errors="coerce").astype("Int64"),
+        }
+    )
+    out = out[out["same_date"].fillna(False).astype(bool)].drop(columns="same_date")
+    out = out[out["gameday"].notna() & out["home_team"].notna() & out["away_team"].notna()]
+    out["season"] = out["season"].astype(int)
+    out = out[out["season"].between(*seasons)]
+    out = out[(out["home_moneyline"].abs() >= 100) & (out["away_moneyline"].abs() >= 100)]
+    out = out.drop_duplicates(subset=["gameday", "home_team", "away_team", "home_score", "away_score"])
+    return _finish(out, "mlb", config)

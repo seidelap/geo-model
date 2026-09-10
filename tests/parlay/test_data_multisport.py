@@ -115,3 +115,35 @@ def test_finish_probit_spread_and_ids() -> None:
     assert out["resid"].iloc[0] == pytest.approx(2.0 - out["spread_line"].iloc[0])
     assert out["tresid"].iloc[2] == pytest.approx(-4.0)
     assert (out["over_odds"] == -110).all()
+
+
+def test_load_mlb_archive_repaired_shifts_rows(tmp_path, monkeypatch) -> None:
+    import json
+
+    from geo_model.parlay import data_multisport as dm
+
+    # Two true games on one date: (away X @ home Y), (away Z @ home W). The archive stores
+    # row i = (home_* = away side of game i, away_* = home side of game i-1).
+    rows = [
+        {"season": 2015, "date": 20150405.0, "home_team": "Cubs", "away_team": "Yankees", "home_final": 3, "away_final": 9,
+         "home_close_ml": 120, "away_close_ml": -150, "close_over_under": 8.0},
+        {"season": 2015, "date": 20150405.0, "home_team": "Mets", "away_team": "Cardinals", "home_final": 2, "away_final": 5,
+         "home_close_ml": 105, "away_close_ml": -140, "close_over_under": 7.5},
+        {"season": 2015, "date": 20150405.0, "home_team": "Rays", "away_team": "Brewers", "home_final": 1, "away_final": 4,
+         "home_close_ml": 130, "away_close_ml": -115, "close_over_under": 7.0},
+        {"season": 2015, "date": 20150406.0, "home_team": "Reds", "away_team": "Padres", "home_final": 0, "away_final": 0,
+         "home_close_ml": 100, "away_close_ml": -110, "close_over_under": 8.5},
+    ]
+    d = tmp_path / "multisport"
+    d.mkdir()
+    (d / "mlb_archive_10Y.json").write_text(json.dumps(rows))
+    cfg = dm.MultiSportConfig(data_dir=d, margin_sd={"mlb": 4.0})
+    out = dm.load_mlb_archive_repaired(cfg, seasons=(2015, 2015))
+    # Only rows whose successor is on the same date form a game: (Cubs @ Cardinals), (Mets @ Brewers).
+    assert len(out) == 2
+    g = out.set_index("away_team")
+    assert g.loc["CHC", "home_team"] == "STL" and g.loc["CHC", "away_score"] == 3 and g.loc["CHC", "home_score"] == 5
+    assert g.loc["CHC", "away_moneyline"] == 120 and g.loc["CHC", "home_moneyline"] == -140
+    assert g.loc["CHC", "total_line"] == 8.0
+    assert g.loc["NYM", "home_team"] == "MIL" and g.loc["NYM", "home_score"] == 4
+    assert (out["spread_source"] == "moneyline_probit").all()
