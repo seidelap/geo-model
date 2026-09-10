@@ -30,6 +30,7 @@ from geo_model.parlay import (
 )
 from geo_model.parlay.backtest import gaussian_explaining_away_corr, kalman_pair_calibration, kalman_slope
 from geo_model.parlay.data_multisport import MultiSportConfig, load_mlb, load_nba, load_sbr_archive
+from geo_model.parlay.data_soccer import SoccerConfig, load_soccer
 from geo_model.parlay.multisport_backtest import build_pitcher_pairs, moneyline_parlay
 from geo_model.parlay.pairs import stratify
 
@@ -38,6 +39,8 @@ SPORTS = {
     "nba": dict(bins=(0.0, 7.0, 14.0, 1000.0), train_end=2013, market="spread"),
     "nhl": dict(bins=(0.0, 1.0, 2.0, 1000.0), train_end=2014, market="moneyline"),
     "mlb": dict(bins=(0.0, 2.0, 4.0, 1000.0), train_end=2022, market="moneyline"),
+    "epl": dict(bins=(0.0, 1.0, 2.0, 1000.0), train_end=2012, market="moneyline"),
+    "big5": dict(bins=(0.0, 1.0, 2.0, 1000.0), train_end=2012, market="moneyline"),
 }
 
 
@@ -69,6 +72,10 @@ def load(sport: str, cfg: MultiSportConfig) -> pd.DataFrame:
         return load_nba(cfg)
     if sport == "nhl":
         return load_sbr_archive("nhl", cfg)
+    if sport == "epl":
+        return load_soccer(SoccerConfig(divisions=("E0",)))
+    if sport == "big5":
+        return load_soccer(SoccerConfig())
     return load_mlb(cfg)
 
 
@@ -89,6 +96,12 @@ def run_sport(sport: str, cfg: MultiSportConfig, pcfg: ParlayConfig) -> list[str
     d = pcfg.leg_decimal
     be = breakeven_correlation(d)
     out = [f"## {sport.upper()}\n"]
+    if sport in ("epl", "big5"):
+        out.append(
+            "Soccer (football-data.co.uk via the xgabora consolidation): pre-match 1X2 odds, not closing prices. "
+            f"Implied goal margin = {games['margin_fit'].iloc[0]}; draws are a priced outcome, so the moneyline parlay "
+            "below uses the 3-way fair probabilities. 'promoted' = a team not in the division the previous season.\n"
+        )
     slope = np.polyfit(games["spread_line"], games["result"], 1)[0]
     out.append(
         f"{len(games)} games, seasons {games['season'].min()}–{games['season'].max()}, "
@@ -103,11 +116,16 @@ def run_sport(sport: str, cfg: MultiSportConfig, pcfg: ParlayConfig) -> list[str
     for lab in sorted(sb.unique()):
         m = sb == lab
         groups[f"|surprise| {lab}"] = (pairs.loc[m, "h_next_resid"], pairs.loc[m, "a_next_resid"])
-    for lab, m in {
+    extra = {
         "weeks 1-3 of season": pairs["week"] <= 3,
         "both legs same week": pairs["same_next_week"],
         "out-of-sample seasons": pairs["season"] > spec["train_end"],
-    }.items():
+    }
+    if "home_new" in games:
+        flags = games.set_index("game_id")[["home_new", "away_new"]]
+        extra["promoted team in anchor"] = (flags.loc[pairs["game_id"], "home_new"] | flags.loc[pairs["game_id"], "away_new"]).to_numpy()
+        extra["no promoted team"] = ~extra["promoted team in anchor"]
+    for lab, m in extra.items():
         groups[lab] = (pairs.loc[m, "h_next_resid"], pairs.loc[m, "a_next_resid"])
     out.append("### Shared-game pairs: margin residual correlation (prediction: positive)\n")
     out.append(md_table(summary_rows(groups)) + "\n")
@@ -204,14 +222,14 @@ def run_sport(sport: str, cfg: MultiSportConfig, pcfg: ParlayConfig) -> list[str
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sports", default="nba,nhl,mlb")
+    ap.add_argument("--sports", default="nba,nhl,mlb,epl,big5")
     ap.add_argument("--out", default="docs/experiments/parlay-multisport.md")
     args = ap.parse_args()
     cfg = MultiSportConfig()
     pcfg = ParlayConfig()
     d = pcfg.leg_decimal
     be = breakeven_correlation(d)
-    out = ["# Cross-game correlated parlays: NBA, NHL, MLB\n"]
+    out = ["# Cross-game correlated parlays: NBA, NHL, MLB, soccer\n"]
     out.append(
         "Same hypothesis and machinery as `parlay-interaction-effects.md` (NFL), applied to daily sports. "
         "Anchor game H vs A; legs are H's next game and A's next game against different opponents, priced "

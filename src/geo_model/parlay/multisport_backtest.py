@@ -45,22 +45,31 @@ class MoneylineParlayResult:
 
 
 def leg_prices(team_games: pd.DataFrame, games: pd.DataFrame) -> pd.DataFrame:
-    """Attach win/lose decimals and fair win probability to each team-game row.
+    """Attach win/lose decimals and fair probabilities to each team-game row.
+
+    Three-way markets (soccer 1X2) are supported through an optional ``p_draw``
+    column on ``games``: the "lose" leg is the opponent's win price, whose fair
+    probability is ``1 - p_win - p_draw``.
 
     Args:
         team_games: Output of :func:`to_team_games`.
-        games: Cleaned games with ``home_decimal, away_decimal, p_home``.
+        games: Cleaned games with ``home_decimal, away_decimal, p_home`` and
+            optionally ``p_draw``.
 
     Returns:
-        ``team_games`` with ``win_decimal, lose_decimal, p_win, won`` columns.
+        ``team_games`` with ``win_decimal, lose_decimal, p_win, p_lose`` columns.
     """
-    g = games.set_index("game_id")[["home_decimal", "away_decimal", "p_home"]]
+    cols = ["home_decimal", "away_decimal", "p_home"] + (["p_draw"] if "p_draw" in games else [])
+    g = games.set_index("game_id")[cols]
     tg = team_games.join(g, on="game_id")
+    if "p_draw" not in tg:
+        tg["p_draw"] = 0.0
+    tg["p_draw"] = tg["p_draw"].fillna(0.0)
     home = tg["is_home"].to_numpy()
     tg["win_decimal"] = np.where(home, tg["home_decimal"], tg["away_decimal"])
     tg["lose_decimal"] = np.where(home, tg["away_decimal"], tg["home_decimal"])
-    tg["p_win"] = np.where(home, tg["p_home"], 1 - tg["p_home"])
-    tg["won"] = (tg["resid"] + tg["exp_margin_placeholder"] > 0) if "exp_margin_placeholder" in tg else np.nan
+    tg["p_win"] = np.where(home, tg["p_home"], 1 - tg["p_home"] - tg["p_draw"])
+    tg["p_lose"] = np.where(home, 1 - tg["p_home"] - tg["p_draw"], tg["p_home"])
     return tg
 
 
@@ -76,9 +85,10 @@ def _attach_next_prices(pairs: pd.DataFrame, tg: pd.DataFrame, games: pd.DataFra
         out[f"{side}_win_dec"] = rows["win_decimal"].to_numpy()
         out[f"{side}_lose_dec"] = rows["lose_decimal"].to_numpy()
         out[f"{side}_p_win"] = rows["p_win"].to_numpy()
+        out[f"{side}_p_lose"] = rows["p_lose"].to_numpy()
         margin = res.reindex(out[gid_col]).to_numpy() * np.where(rows["is_home"].to_numpy(), 1, -1)
         out[f"{side}_won"] = margin > 0
-        out[f"{side}_tie"] = margin == 0
+        out[f"{side}_lost"] = margin < 0
     return out
 
 
@@ -97,14 +107,14 @@ def moneyline_parlay(pairs: pd.DataFrame, tg: pd.DataFrame, games: pd.DataFrame,
         :class:`MoneylineParlayResult`.
     """
     p = _attach_next_prices(pairs, tg, games)
-    p = p.dropna(subset=["h_win_dec", "a_win_dec", "h_lose_dec", "a_lose_dec", "h_p_win", "a_p_win"])
-    p = p[~p["h_tie"] & ~p["a_tie"]]
+    p = p.dropna(subset=["h_win_dec", "a_win_dec", "h_lose_dec", "a_lose_dec", "h_p_win", "a_p_win", "h_p_lose", "a_p_lose"])
+    # Ties/draws: a tied leg loses both parlays (no push handling; in soccer the draw is a priced outcome).
     both_win = p["h_won"] & p["a_won"]
-    both_lose = ~p["h_won"] & ~p["a_won"]
+    both_lose = p["h_lost"] & p["a_lost"]
     pay_ww = p["h_win_dec"] * p["a_win_dec"]
     pay_ll = p["h_lose_dec"] * p["a_lose_dec"]
     profit = np.where(both_win, pay_ww, 0.0) + np.where(both_lose, pay_ll, 0.0) - 2.0
-    ind = p["h_p_win"] * p["a_p_win"] * pay_ww + (1 - p["h_p_win"]) * (1 - p["a_p_win"]) * pay_ll - 2.0
+    ind = p["h_p_win"] * p["a_p_win"] * pay_ww + p["h_p_lose"] * p["a_p_lose"] * pay_ll - 2.0
     n = len(p)
     if n == 0:
         nan = float("nan")
@@ -114,7 +124,7 @@ def moneyline_parlay(pairs: pd.DataFrame, tg: pd.DataFrame, games: pd.DataFrame,
     diffs = profit - ind.to_numpy()
     boots = np.array([diffs[rng.integers(0, n, n)].mean() / 2.0 for _ in range(n_boot)])
     same = both_win | both_lose
-    same_ind = p["h_p_win"] * p["a_p_win"] + (1 - p["h_p_win"]) * (1 - p["a_p_win"])
+    same_ind = p["h_p_win"] * p["a_p_win"] + p["h_p_lose"] * p["a_p_lose"]
     return MoneylineParlayResult(
         n_pairs=int(n),
         realized_roi=float(profit.mean() / 2.0),
