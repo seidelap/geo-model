@@ -8,6 +8,7 @@ survival curves over 18 PLOVER event types.
 - **Component specs:** `docs/components/01-06` (dependency order in `docs/components/README.md`)
 - **Session tasks:** `docs/SESSION_TASKS.md` (27 sessions, parallelization map)
 - **Status:** Skeleton created, implementation starting at Component 1
+- **Side experiments:** `docs/experiments/` (e.g. parlay interaction-effect backtest, `src/geo_model/parlay/`)
 
 ## Architecture at a Glance
 
@@ -85,6 +86,9 @@ python -m pytest tests/ -m "not slow"   # skip GPU/data-heavy tests
 
 # Evaluation — TODO
 # python -m geo_model.evaluate --split test
+
+# Side experiment: cross-game correlated-parlay backtest (writes docs/experiments/...)
+python scripts/backtest_parlay.py            # add --refresh to re-download games
 ```
 
 ## Coding Standards
