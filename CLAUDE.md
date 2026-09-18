@@ -150,6 +150,23 @@ Exploratory work that is not part of the six-layer pipeline lives under `researc
   data layout and conventions: `research/privileged_tracking/README.md`; results:
   `research/privileged_tracking/reports/README.md`.
   Tests: `python -m pytest research/privileged_tracking/tests -q`
+- `research/scenario_ev/`: phase 2 of the above. Not "is a model better on average" but
+  "can one stat be priced against a bookmaker's rolling-mean heuristic in a specific
+  scenario". Stages: 01 cards, 02 corners, 03 player pass counts, 04 fouls, 05 the
+  cross-candidate generalist-vs-specialist gate sweep, 06 the haircut reconciliation.
+  Synthesis and verdict:
+  `research/scenario_ev/reports/README.md`; per-metric index:
+  `research/scenario_ev/reports/results_index.parquet` (rebuild with
+  `python -m research.scenario_ev.results_index`). Reports and result tables:
+  `research/scenario_ev/reports/`. Protocol (fixed discovery/confirmation split, the
+  gate, a recalibrated rolling-mean book proxy, and a goals-market haircut on every EV
+  claim) is stated in each report's section 1. One haircut definition governs the phase
+  (`research/scenario_ev/haircut.py`, the margin-matched round trip).
+  Reports are pinned to the tables they were rendered from: after re-running any stage,
+  re-render every report that reads its tables, then run
+  `python -m research.scenario_ev.haircut`, `... .results_index` and
+  `... .report_sources --update`, or the test suite fails.
+  Tests: `python -m pytest research/scenario_ev/tests -q`
 - `research/soccer_edge/`: parked betting-edge detectors (see its README).
 
 Raw research data lives under `data/raw/privileged/` (ignored); paths are configured with
