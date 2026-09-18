@@ -139,3 +139,20 @@ the corresponding `docs/components/0X-*.md` spec rather than restating it.
 ### Root vs Subdirectory
 - **Root:** project-wide conventions, architecture, commands, terminology
 - **Subdirectory:** module-specific patterns, data format gotchas, internal APIs
+
+## Research Side-Projects
+
+Exploratory work that is not part of the six-layer pipeline lives under `research/`
+(never imported by `src/geo_model`):
+
+- `research/privileged_tracking/`: learning game state from rare tracking data (NFL 2017
+  tracking, StatsBomb 360) and imputing it where only event data exists. Entry points,
+  data layout and conventions: `research/privileged_tracking/README.md`; results:
+  `research/privileged_tracking/reports/README.md`.
+  Tests: `python -m pytest research/privileged_tracking/tests -q`
+- `research/soccer_edge/`: parked betting-edge detectors (see its README).
+
+Raw research data lives under `data/raw/privileged/` (ignored); paths are configured with
+`PRIV_DATA_DIR`. Only GitHub raw content, GitHub release assets and PyPI (via the proxy)
+are reachable from the web sandbox; ESPN, football-data.co.uk, Kaggle, Understat and FBref
+are blocked.
