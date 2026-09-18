@@ -54,6 +54,32 @@ def paired_bootstrap_delta(loss_a: np.ndarray, loss_b: np.ndarray, n_boot: int =
     return float(d.mean()), float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975))
 
 
+def clustered_bootstrap_delta(loss_a: np.ndarray, loss_b: np.ndarray, groups: np.ndarray,
+                              n_boot: int = 2000, seed: int = 0) -> tuple[float, float, float]:
+    """Group-clustered bootstrap CI for mean(loss_a - loss_b) over paired per-sample losses.
+
+    Whole groups (games / matches) are resampled with replacement, so the interval
+    accounts for the within-group correlation that a per-sample bootstrap ignores.
+    Positive values mean ``b`` is better (lower loss) than ``a``.
+
+    Args:
+        loss_a, loss_b: per-sample losses ``[n]``.
+        groups: group id per sample ``[n]`` (any hashable dtype).
+
+    Returns:
+        ``(mean_delta, ci_low, ci_high)`` at 95%; ``mean_delta`` is the plain sample mean.
+    """
+    d = np.asarray(loss_a, dtype=float) - np.asarray(loss_b, dtype=float)
+    _, inv = np.unique(np.asarray(groups), return_inverse=True)
+    n_groups = int(inv.max()) + 1 if len(inv) else 0
+    sums = np.bincount(inv, weights=d, minlength=n_groups)
+    counts = np.bincount(inv, minlength=n_groups).astype(float)
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n_groups, size=(n_boot, n_groups))
+    means = sums[idx].sum(axis=1) / counts[idx].sum(axis=1)
+    return float(d.mean()), float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975))
+
+
 def per_sample_log_loss(y: np.ndarray, p: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     """Element-wise binary log-loss, for paired comparisons."""
     p = np.clip(np.asarray(p, dtype=float), eps, 1 - eps)

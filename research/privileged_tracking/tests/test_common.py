@@ -7,6 +7,7 @@ import pandas as pd
 from research.privileged_tracking.common.metrics import (
     brier,
     calibration_table,
+    clustered_bootstrap_delta,
     log_loss,
     mae,
     paired_bootstrap_delta,
@@ -42,6 +43,25 @@ def test_paired_bootstrap_delta_sign() -> None:
     b = np.full(500, 0.6)
     m, lo, hi = paired_bootstrap_delta(a, b, n_boot=200)
     assert abs(m - 0.1) < 1e-12 and lo <= m <= hi
+
+
+def test_clustered_bootstrap_delta_widens_with_within_group_correlation() -> None:
+    rng = np.random.default_rng(3)
+    n_groups, per_group = 40, 50
+    groups = np.repeat(np.arange(n_groups), per_group)
+    # per-sample deltas that are constant within a group: the play-level bootstrap is far too narrow
+    d = np.repeat(rng.normal(0.1, 1.0, n_groups), per_group)
+    a, b = d + 1.0, np.full(len(d), 1.0)
+    m_c, lo_c, hi_c = clustered_bootstrap_delta(a, b, groups, n_boot=400)
+    m_p, lo_p, hi_p = paired_bootstrap_delta(a, b, n_boot=400)
+    assert abs(m_c - d.mean()) < 1e-12 and abs(m_p - m_c) < 1e-12
+    assert lo_c <= m_c <= hi_c
+    assert (hi_c - lo_c) > 3 * (hi_p - lo_p)
+    # independent samples: the two intervals agree in width to within a factor of ~1.5
+    d2 = rng.normal(0.1, 1.0, len(d))
+    _, lo_c2, hi_c2 = clustered_bootstrap_delta(d2, np.zeros(len(d2)), groups, n_boot=400)
+    _, lo_p2, hi_p2 = paired_bootstrap_delta(d2, np.zeros(len(d2)), n_boot=400)
+    assert 0.6 < (hi_c2 - lo_c2) / (hi_p2 - lo_p2) < 1.6
 
 
 def test_calibration_table_bins() -> None:
@@ -80,3 +100,13 @@ def test_out_of_fold_predictions_cover_all_rows() -> None:
     oof = out_of_fold_predictions(fit_predict, X, y, groups, n_splits=5)
     assert not np.isnan(oof).any()
     assert np.allclose(oof, y)
+
+
+def test_md_table_formats_ints_floats_and_nan() -> None:
+    from research.privileged_tracking.common.report import md_table
+
+    df = pd.DataFrame({"model": ["a", "b"], "n": [3, 4], "plays": [10.0, 20.0], "log_loss": [0.5, np.nan]})
+    out = md_table(df, floatfmt="{:.2f}")
+    lines = out.split("\n")
+    assert lines[0] == "| model | n | plays | log_loss |" and lines[1] == "|---|---|---|---|"
+    assert lines[2] == "| a | 3 | 10 | 0.50 |" and lines[3] == "| b | 4 | 20 |  |"
